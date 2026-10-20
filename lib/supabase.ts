@@ -2,7 +2,40 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/lib/database.types";
 
 export type Customer = Database["public"]["Tables"]["customers"]["Row"] & {
-  pending_balance: number;
+  total_billed: number | null;
+  total_paid: number | null;
+  pending_balance: number | null;
+};
+
+export type DailyTotals = {
+  sales: number | null;
+  collection: number | null;
+};
+
+export type RecentSale = {
+  id: string;
+  customer_id: string;
+  sale_date: string;
+  total_amount: number;
+  amount_paid: number;
+  balance: number;
+  created_at: string;
+};
+
+export type CustomerSummaryResult = {
+  customers: Customer[];
+  totalCustomers: number | null;
+  totalBilled: number | null;
+  totalPaid: number | null;
+  outstanding: number | null;
+  dailyTotals: Record<string, DailyTotals>;
+  recentSales: RecentSale[];
+  salesAvailable: boolean;
+  salesComplete: boolean;
+  paymentsAvailable: boolean;
+  paymentsComplete: boolean;
+  customersComplete: boolean;
+  warning: string | null;
 };
 
 export type LedgerEntry =
@@ -42,6 +75,85 @@ export type DashboardStats = {
   todaysCashCollected: number;
 };
 
+type SalesSummaryRow = Pick<
+  Database["public"]["Tables"]["sales"]["Row"],
+  | "id"
+  | "customer_id"
+  | "sale_date"
+  | "total_amount"
+  | "amount_paid"
+  | "balance"
+  | "created_at"
+>;
+type PaymentSummaryRow = Pick<
+  Database["public"]["Tables"]["payments"]["Row"],
+  "customer_id" | "payment_date" | "amount" | "id"
+>;
+
+const QUERY_PAGE_SIZE = 500;
+const MAX_DASHBOARD_ROWS = 10_000;
+
+type QueryError = {
+  code?: string;
+  message: string;
+};
+
+class SupabaseQueryError extends Error {
+  constructor(readonly code: string | undefined, message: string) {
+    super(message);
+    this.name = "SupabaseQueryError";
+  }
+}
+
+type PagedRows<T> = {
+  rows: T[];
+  complete: boolean;
+};
+
+async function fetchAllPages<T>(
+  fetchPage: (
+    from: number,
+    to: number,
+  ) => Promise<{
+    data: T[] | null;
+    error: QueryError | null;
+    count: number | null;
+  }>,
+): Promise<PagedRows<T>> {
+  const rows: T[] = [];
+  let expectedCount: number | null = null;
+  let from = 0;
+
+  while (rows.length < MAX_DASHBOARD_ROWS) {
+    const pageSize = Math.min(QUERY_PAGE_SIZE, MAX_DASHBOARD_ROWS - rows.length);
+    const { data, error, count } = await fetchPage(
+      from,
+      from + pageSize - 1,
+    );
+    if (error) throw new SupabaseQueryError(error.code, error.message);
+    if (!data) throw new Error("Supabase returned no data for a dashboard query.");
+
+    if (from === 0) {
+      expectedCount = count;
+      rows.push(...data);
+      from = data.length;
+      if (expectedCount === null) return { rows, complete: false };
+      if (rows.length >= expectedCount) return { rows, complete: true };
+      if (data.length === 0) return { rows, complete: false };
+      continue;
+    }
+
+    rows.push(...data);
+    from += data.length;
+    if (expectedCount !== null && rows.length >= expectedCount) {
+      return { rows, complete: true };
+    }
+    if (data.length === 0) return { rows, complete: false };
+  }
+
+  return { rows, complete: expectedCount !== null && rows.length >= expectedCount };
+}
+
 let client: SupabaseClient<Database> | undefined;
 
 export function getSupabaseClient(): SupabaseClient<Database> {
@@ -77,59 +189,235 @@ function requireData<T>(data: T | null, error: { message: string } | null): T {
 }
 
 export async function fetchCustomers(): Promise<Customer[]> {
+  return (await fetchCustomersWithTotals()).customers;
+}
+
+export function getBusinessDate(date = new Date()): string {
+  const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return localDate.toISOString().slice(0, 10);
+}
+
+export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult> {
   const supabase = getSupabaseClient();
-  const { data, error } = await supabase.rpc(
-    "fetch_customers_with_balances",
-    {},
-  );
-  if (!error) {
-    const customers = requireData(data, null);
-    return customers.map((customer) => ({
-      ...customer,
-      pending_balance: Number(customer.pending_balance),
-    }));
-  }
-
-  if (error.code !== "PGRST202" && error.code !== "42883") {
-    throw new Error(error.message);
-  }
-
-  const [customersResult, salesResult, paymentsResult] = await Promise.all([
-    supabase
+  const customersResult = await fetchAllPages<
+    Database["public"]["Tables"]["customers"]["Row"]
+  >(async (from, to) =>
+    await supabase
       .from("customers")
-      .select("id, name, phone, address, created_at")
-      .order("name"),
-    supabase.from("sales").select("customer_id, total_amount, amount_paid"),
-    supabase.from("payments").select("customer_id, amount"),
-  ]);
-  const customers = requireData(customersResult.data, customersResult.error);
-  const sales = requireData(salesResult.data, salesResult.error);
-  const payments = requireData(paymentsResult.data, paymentsResult.error);
-  const balanceByCustomer = new Map<string, number>();
+      .select("id, name, phone, address, created_at", {
+        count: from === 0 ? "exact" : undefined,
+      })
+      .order("name")
+      .order("id")
+      .range(from, to),
+  );
 
-  for (const sale of sales) {
-    balanceByCustomer.set(
-      sale.customer_id,
-      (balanceByCustomer.get(sale.customer_id) ?? 0) +
-        Number(sale.total_amount) -
-        Number(sale.amount_paid),
-    );
-  }
-  for (const payment of payments) {
-    balanceByCustomer.set(
-      payment.customer_id,
-      (balanceByCustomer.get(payment.customer_id) ?? 0) -
-        Number(payment.amount),
-    );
-  }
-
-  return customers.map((customer) => ({
-    ...customer,
-    pending_balance: Math.max(
-      0,
-      Math.round((balanceByCustomer.get(customer.id) ?? 0) * 100) / 100,
+  const [salesResult, paymentsResult] = await Promise.all([
+    fetchAllPages<SalesSummaryRow>(async (from, to) =>
+      await supabase
+        .from("sales")
+        .select(
+          "id, customer_id, sale_date, total_amount, amount_paid, balance, created_at",
+          { count: from === 0 ? "exact" : undefined },
+        )
+        .order("sale_date", { ascending: false })
+        .order("id", { ascending: false })
+        .range(from, to),
+    ).catch((error: unknown) => handleMissingLedgerTable<SalesSummaryRow>(error)),
+    fetchAllPages<PaymentSummaryRow>(async (from, to) =>
+      await supabase
+        .from("payments")
+        .select("customer_id, payment_date, amount, id", {
+          count: from === 0 ? "exact" : undefined,
+        })
+        .order("payment_date", { ascending: false })
+        .order("id", { ascending: false })
+        .range(from, to),
+    ).catch((error: unknown) =>
+      handleMissingLedgerTable<PaymentSummaryRow>(error),
     ),
-  }));
+  ]);
+
+  const salesAvailable = salesResult !== null;
+  const paymentsAvailable = paymentsResult !== null;
+  const salesComplete = salesResult?.complete ?? false;
+  const paymentsComplete = paymentsResult?.complete ?? false;
+  const customersComplete = customersResult.complete;
+  const sales = salesResult?.rows ?? [];
+  const payments = paymentsResult?.rows ?? [];
+  const canUseSales = salesAvailable && salesComplete;
+  const canUsePayments = paymentsAvailable && paymentsComplete;
+  const canCalculateCollected = canUseSales && canUsePayments;
+  const totalsByCustomer = new Map<
+    string,
+    { billedCents: number; paidCents: number }
+  >();
+  const dailyTotalsCents = new Map<
+    string,
+    { salesCents: number; collectionCents: number }
+  >();
+
+  if (canUseSales) {
+    for (const sale of sales) {
+      const billedCents = toCents(Number(sale.total_amount));
+      const salePaidCents = toCents(Number(sale.amount_paid));
+      const totals = totalsByCustomer.get(sale.customer_id) ?? {
+        billedCents: 0,
+        paidCents: 0,
+      };
+      totals.billedCents += billedCents;
+      totals.paidCents += salePaidCents;
+      totalsByCustomer.set(sale.customer_id, totals);
+
+      const daily = dailyTotalsCents.get(sale.sale_date) ?? {
+        salesCents: 0,
+        collectionCents: 0,
+      };
+      daily.salesCents += billedCents;
+      daily.collectionCents += salePaidCents;
+      dailyTotalsCents.set(sale.sale_date, daily);
+    }
+  }
+  if (canCalculateCollected) {
+    for (const payment of payments) {
+      const paidCents = toCents(Number(payment.amount));
+      const totals = totalsByCustomer.get(payment.customer_id) ?? {
+        billedCents: 0,
+        paidCents: 0,
+      };
+      totals.paidCents += paidCents;
+      totalsByCustomer.set(payment.customer_id, totals);
+
+      const daily = dailyTotalsCents.get(payment.payment_date) ?? {
+        salesCents: 0,
+        collectionCents: 0,
+      };
+      daily.collectionCents += paidCents;
+      dailyTotalsCents.set(payment.payment_date, daily);
+    }
+  }
+
+  const allTimeBilledCents = canUseSales
+    ? sales.reduce((sum, sale) => sum + toCents(Number(sale.total_amount)), 0)
+    : null;
+  const allTimePaidCents = canCalculateCollected
+    ? sales.reduce((sum, sale) => sum + toCents(Number(sale.amount_paid)), 0) +
+      payments.reduce((sum, payment) => sum + toCents(Number(payment.amount)), 0)
+    : null;
+  const outstandingCents = canCalculateCollected
+    ? Array.from(totalsByCustomer.values()).reduce(
+        (sum, totals) =>
+          sum + Math.max(0, totals.billedCents - totals.paidCents),
+        0,
+      )
+    : null;
+  const warnings: string[] = [];
+  if (!salesAvailable) warnings.push("Sales data is unavailable (public.sales).");
+  else if (!salesComplete) {
+    warnings.push(
+      `Sales exceed the ${MAX_DASHBOARD_ROWS.toLocaleString("en-IN")} row dashboard safety limit; financial totals and trends are withheld.`,
+    );
+  }
+  if (!paymentsAvailable) {
+    warnings.push("Payment data is unavailable (public.payments).");
+  } else if (!paymentsComplete) {
+    warnings.push(
+      `Payments exceed the ${MAX_DASHBOARD_ROWS.toLocaleString("en-IN")} row dashboard safety limit; collection and due totals are withheld.`,
+    );
+  }
+  if (!customersComplete) {
+    warnings.push(
+      `Customer records exceed the ${MAX_DASHBOARD_ROWS.toLocaleString("en-IN")} row dashboard safety limit; the list and customer count may be incomplete.`,
+    );
+  }
+
+  const customers = customersResult.rows.map((customer) => {
+    const totals = totalsByCustomer.get(customer.id) ?? {
+      billedCents: 0,
+      paidCents: 0,
+    };
+    const totalBilled = canUseSales ? fromCents(totals.billedCents) : null;
+    const totalPaid = canCalculateCollected
+      ? fromCents(totals.paidCents)
+      : null;
+    return {
+      ...customer,
+      total_billed: totalBilled,
+      total_paid: totalPaid,
+      pending_balance:
+        totalBilled !== null && totalPaid !== null
+          ? fromCents(Math.max(0, totals.billedCents - totals.paidCents))
+          : null,
+    };
+  });
+
+  const dailyTotals: Record<string, DailyTotals> = {};
+  if (canUseSales) {
+    for (const [date, totals] of dailyTotalsCents) {
+      dailyTotals[date] = {
+        sales: fromCents(totals.salesCents),
+        collection: canCalculateCollected
+          ? fromCents(totals.collectionCents)
+          : null,
+      };
+    }
+  }
+  if (canCalculateCollected) {
+    for (const [date, totals] of dailyTotalsCents) {
+      dailyTotals[date] = {
+        sales: fromCents(totals.salesCents),
+        collection: fromCents(totals.collectionCents),
+      };
+    }
+    for (const payment of payments) {
+      if (!dailyTotals[payment.payment_date]) {
+        dailyTotals[payment.payment_date] = {
+          sales: 0,
+          collection: fromCents(
+            dailyTotalsCents.get(payment.payment_date)?.collectionCents ?? 0,
+          ),
+        };
+      }
+    }
+  }
+
+  return {
+    customers,
+    totalCustomers: customersComplete ? customers.length : null,
+    totalBilled:
+      allTimeBilledCents === null ? null : fromCents(allTimeBilledCents),
+    totalPaid: allTimePaidCents === null ? null : fromCents(allTimePaidCents),
+    outstanding:
+      outstandingCents === null ? null : fromCents(outstandingCents),
+    dailyTotals,
+    recentSales: canUseSales ? sales.slice(0, 8) : [],
+    salesAvailable,
+    salesComplete,
+    paymentsAvailable,
+    paymentsComplete,
+    customersComplete,
+    warning: warnings.length ? warnings.join(" ") : null,
+  };
+}
+
+async function handleMissingLedgerTable<T>(
+  error: unknown,
+): Promise<PagedRows<T> | null> {
+  if (
+    error instanceof SupabaseQueryError &&
+    (error.code === "42P01" || error.code === "PGRST205")
+  ) {
+    return null;
+  }
+  throw error;
+}
+
+function toCents(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100);
+}
+
+function fromCents(value: number): number {
+  return value / 100;
 }
 
 export async function addCustomer(input: {

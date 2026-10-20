@@ -4,9 +4,10 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   Banknote,
+  BarChart3,
+  BookOpen,
   Check,
   ChevronDown,
-  ChevronRight,
   CircleHelp,
   ClipboardList,
   IndianRupee,
@@ -16,6 +17,7 @@ import {
   MessageCircle,
   Plus,
   Package,
+  RefreshCw,
   Search,
   ShoppingBag,
   Sprout,
@@ -32,15 +34,19 @@ import {
 import {
   addCustomer,
   addDailySale,
-  fetchDashboardStats,
   fetchCustomerLedger,
-  fetchCustomers,
+  getBusinessDate,
   getSupabaseClient,
   recordStandalonePayment,
   type Customer,
-  type DashboardStats,
+  type CustomerSummaryResult,
+  type DailyTotals,
   type LedgerEntry,
 } from "@/lib/supabase";
+import {
+  createCustomer,
+  getCustomersWithBalance,
+} from "@/lib/db";
 
 const money = new Intl.NumberFormat("en-IN", {
   style: "currency",
@@ -52,6 +58,20 @@ function formatMoney(amount: number) {
   return money.format(amount);
 }
 
+function formatOptionalMoney(amount: number | null) {
+  return amount === null ? "Unavailable" : formatMoney(amount);
+}
+
+function formatMetric(
+  amount: number | null | undefined,
+  loading: boolean,
+  stale: boolean,
+) {
+  if (loading) return "Refreshing…";
+  if (stale || amount == null) return "Unavailable";
+  return formatMoney(amount);
+}
+
 function formatDate(value: string) {
   return new Intl.DateTimeFormat("en-IN", {
     day: "2-digit",
@@ -60,11 +80,16 @@ function formatDate(value: string) {
   }).format(new Date(`${value.slice(0, 10)}T00:00:00`));
 }
 
+function formatBusinessDate(value: string) {
+  return new Intl.DateTimeFormat("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(new Date(`${value.slice(0, 10)}T12:00:00`));
+}
+
 function today() {
-  const now = new Date();
-  return new Date(now.getTime() - now.getTimezoneOffset() * 60_000)
-    .toISOString()
-    .slice(0, 10);
+  return getBusinessDate();
 }
 
 type ModalKind = "customer" | "sale" | "payment" | "ledger" | null;
@@ -78,10 +103,10 @@ export default function Home() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [customers, setCustomers] = useState<Customer[]>([]);
-  const [dashboardStats, setDashboardStats] = useState<DashboardStats>({
-    todaysSale: 0,
-    todaysCashCollected: 0,
-  });
+  const [dashboardData, setDashboardData] =
+    useState<CustomerSummaryResult | null>(null);
+  const [businessDate, setBusinessDate] = useState(today);
+  const [dataStale, setDataStale] = useState(false);
   const [dataLoading, setDataLoading] = useState(false);
   const [dataError, setDataError] = useState("");
   const [query, setQuery] = useState("");
@@ -126,10 +151,15 @@ export default function Home() {
   const refreshCustomers = useCallback(async () => {
     setDataLoading(true);
     setDataError("");
+    setDataStale(false);
     try {
-      setCustomers(await fetchCustomers());
-      return true;
+      const result = await getCustomersWithBalance();
+      setCustomers(result.customers);
+      setDashboardData(result);
+      setDataError(result.warning ?? "");
+      return !result.warning;
     } catch (error) {
+      setDataStale(true);
       setDataError(
         error instanceof Error ? error.message : "Unable to load customer records.",
       );
@@ -139,24 +169,9 @@ export default function Home() {
     }
   }, []);
 
-  const refreshDashboardStats = useCallback(async () => {
-    try {
-      setDashboardStats(await fetchDashboardStats(today()));
-    } catch (error) {
-      setDataError(
-        error instanceof Error
-          ? error.message
-          : "Unable to load today's sales totals.",
-      );
-    }
-  }, []);
-
   useEffect(() => {
-    if (authenticated) {
-      void refreshCustomers();
-      void refreshDashboardStats();
-    }
-  }, [authenticated, refreshCustomers, refreshDashboardStats]);
+    if (authenticated) void refreshCustomers();
+  }, [authenticated, refreshCustomers]);
 
   const visibleCustomers = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -169,10 +184,19 @@ export default function Home() {
     );
   }, [customers, query]);
 
-  const totalOutstanding = customers.reduce(
-    (total, customer) => total + customer.pending_balance,
-    0,
-  );
+  const dailyTotals: DailyTotals | undefined =
+    dashboardData?.dailyTotals[businessDate];
+  const dailySales =
+    dashboardData?.salesAvailable && dashboardData.salesComplete
+      ? dailyTotals?.sales ?? 0
+      : null;
+  const dailyCollection =
+    dashboardData?.salesAvailable &&
+    dashboardData.salesComplete &&
+    dashboardData.paymentsAvailable &&
+    dashboardData.paymentsComplete
+      ? dailyTotals?.collection ?? 0
+      : null;
 
   async function handleSignIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -231,7 +255,7 @@ export default function Home() {
     setFormError("");
     const form = new FormData(event.currentTarget);
     try {
-      const createdCustomer = await addCustomer({
+      const createdCustomer = await createCustomer({
         name: String(form.get("name") ?? ""),
         phone: String(form.get("phone") ?? ""),
         address: String(form.get("address") ?? ""),
@@ -241,15 +265,21 @@ export default function Home() {
         if (current.some((customer) => customer.id === createdCustomer.id)) {
           return current;
         }
-        return [...current, { ...createdCustomer, pending_balance: 0 }].sort(
-          (left, right) => left.name.localeCompare(right.name),
-        );
+        return [
+          ...current,
+          {
+            ...createdCustomer,
+            total_billed: null,
+            total_paid: null,
+            pending_balance: null,
+          },
+        ].sort((left, right) => left.name.localeCompare(right.name));
       });
       setModal(null);
       setSuccessMessage(
         refreshed
           ? "Customer added to your ledger."
-          : "Customer added, but the customer list could not be refreshed. Use Try again to reload it.",
+          : "Customer added. Customer balances are partially unavailable; see the warning above.",
       );
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Unable to add customer.");
@@ -288,10 +318,7 @@ export default function Home() {
         saleDate: String(form.get("saleDate") ?? today()),
         notes: String(form.get("notes") ?? ""),
       });
-      const [customersRefreshed] = await Promise.all([
-        refreshCustomers(),
-        refreshDashboardStats(),
-      ]);
+      const customersRefreshed = await refreshCustomers();
       setModal(null);
       setSuccessMessage(
         customersRefreshed
@@ -318,10 +345,7 @@ export default function Home() {
         paymentDate: String(form.get("paymentDate") ?? today()),
         notes: String(form.get("notes") ?? ""),
       });
-      const [customersRefreshed] = await Promise.all([
-        refreshCustomers(),
-        refreshDashboardStats(),
-      ]);
+      const customersRefreshed = await refreshCustomers();
       setModal(null);
       setSuccessMessage(
         customersRefreshed
@@ -498,13 +522,44 @@ export default function Home() {
               <div>
                 <p className="text-xs text-[#828b84]">Karumbu Sakkarai · Admin</p>
                 <h1 className="mt-0.5 text-lg font-semibold tracking-[-0.03em] sm:text-xl">
-                  Sales &amp; Khata
+                  கரும்பு சர்க்கரை - Khata Admin
                 </h1>
+                <p className="mt-0.5 hidden text-xs text-[#828b84] sm:block">
+                  Daily Packet Sales &amp; Customer Ledger
+                </p>
               </div>
             </div>
-            <div className="hidden items-center gap-2 rounded-full border border-[#e7e9e3] bg-white px-3 py-2 text-xs font-medium text-[#68756c] sm:flex">
-              <span className="h-2 w-2 rounded-full bg-[#67a879]" />
-              Ledger up to date
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                className={`${secondaryButton} hidden sm:inline-flex`}
+                onClick={() => openModal("customer")}
+              >
+                <Plus size={16} />
+                Add Customer
+              </button>
+              <button
+                type="button"
+                className={primaryButton}
+                onClick={() => openModal("sale")}
+              >
+                <Plus size={16} />
+                <span className="hidden sm:inline">New Sale Entry</span>
+                <span className="sm:hidden">New Sale</span>
+              </button>
+              <button
+                type="button"
+                aria-label="Refresh dashboard"
+                title="Refresh customer data"
+                className={`${secondaryButton} !w-10 !px-0`}
+                disabled={dataLoading}
+                onClick={() => void refreshCustomers()}
+              >
+                <RefreshCw
+                  size={16}
+                  className={dataLoading ? "animate-spin" : ""}
+                />
+              </button>
             </div>
           </div>
         </header>
@@ -515,38 +570,12 @@ export default function Home() {
             className="flex flex-col justify-between gap-5 sm:flex-row sm:items-end"
           >
             <div>
-              <p className="text-sm font-medium text-[#758078]">
-                {new Intl.DateTimeFormat("en-IN", {
-                  weekday: "long",
-                  day: "numeric",
-                  month: "long",
-                  year: "numeric",
-                }).format(new Date())}
-              </p>
               <h2 className="mt-2 text-[27px] font-semibold tracking-[-0.045em] sm:text-[34px]">
-                Good business starts here.
+                Daily Packet Sales &amp; Customer Ledger
               </h2>
               <p className="mt-1.5 max-w-xl text-sm leading-6 text-[#7b847e]">
-                A clear view of your cane sugar sales and customer balances.
+                Manage customers, track khata balances, and keep your sales records current.
               </p>
-            </div>
-            <div className="flex flex-wrap gap-2.5">
-              <button
-                type="button"
-                className={secondaryButton}
-                onClick={() => openModal("payment")}
-              >
-                <ArrowDownLeft size={16} />
-                Record payment
-              </button>
-              <button
-                type="button"
-                className={primaryButton}
-                onClick={() => openModal("sale")}
-              >
-                <Plus size={17} />
-                Quick sale entry
-              </button>
             </div>
           </section>
 
@@ -573,34 +602,100 @@ export default function Home() {
                 className="font-semibold underline underline-offset-2"
                 onClick={() => void refreshCustomers()}
               >
-                Try again
+                {dataStale ? "Retry" : "Refresh"}
               </button>
             </div>
           )}
 
-          <section aria-label="Business summary" className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <SummaryCard
-              label="Today’s sale"
-              value={formatMoney(dashboardStats.todaysSale)}
-              detail="Sales recorded today"
-              icon={<Package size={19} />}
-              accent="green"
-            />
-            <SummaryCard
-              label="Today’s cash collected"
-              value={formatMoney(dashboardStats.todaysCashCollected)}
-              detail="Including payments against old dues"
-              icon={<Banknote size={19} />}
-              accent="cream"
-            />
-            <SummaryCard
-              label="Market pending balance"
-              value={formatMoney(totalOutstanding)}
-              detail="Outstanding across all customers"
-              icon={<IndianRupee size={19} />}
-              accent="sage"
-              className="sm:col-span-2 xl:col-span-1"
-            />
+          <section aria-label="Dashboard summary" className="mt-8">
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]">
+                    Business overview
+                  </h2>
+                  <span className="rounded-full bg-[#edf4eb] px-2.5 py-0.5 text-[11px] font-medium text-[#40684b]">
+                    Live Metrics
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-[#838c85]">
+                  All-time totals and daily operational figures are kept strictly distinct.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="flex items-center text-xs font-medium text-[#69766c]">
+                  Business date
+                  <input
+                    className="ml-2 h-9 rounded-lg border border-[#e2e6df] bg-white px-2.5 text-sm font-medium text-[#34443a] outline-none transition focus:border-[#8eae94] focus:ring-2 focus:ring-[#e7f0e7]"
+                    type="date"
+                    value={businessDate}
+                    onChange={(event) => setBusinessDate(event.target.value)}
+                  />
+                </label>
+                {businessDate !== today() && (
+                  <button
+                    type="button"
+                    onClick={() => setBusinessDate(today())}
+                    className="h-9 rounded-lg border border-[#e2e6df] bg-white px-2.5 text-xs font-semibold text-[#285d42] transition hover:bg-[#edf4eb]"
+                  >
+                    Today
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              <SummaryCard
+                label="Total Sales"
+                value={formatMetric(dashboardData?.totalBilled, dataLoading, dataStale)}
+                detail="All-time billed sales value"
+                icon={<Package size={19} />}
+                accent="amber"
+              />
+              <SummaryCard
+                label="Total Collected"
+                value={formatMetric(dashboardData?.totalPaid, dataLoading, dataStale)}
+                detail="Sale receipts + khata collections"
+                icon={<Banknote size={19} />}
+                accent="emerald"
+              />
+              <SummaryCard
+                label="Outstanding Due"
+                value={formatMetric(dashboardData?.outstanding, dataLoading, dataStale)}
+                detail="All-time balance pending recovery"
+                icon={<IndianRupee size={19} />}
+                accent="red"
+              />
+              <SummaryCard
+                label="Total Customers"
+                value={
+                  dataLoading
+                    ? "Refreshing…"
+                    : dataStale || dashboardData?.totalCustomers == null
+                    ? "Unavailable"
+                    : dashboardData.totalCustomers.toLocaleString("en-IN")
+                }
+                detail="Active customers in khata register"
+                icon={<Users size={19} />}
+                accent="green"
+              />
+              <SummaryCard
+                label="Today's Sales"
+                value={formatMetric(dailySales, dataLoading, dataStale)}
+                detail={`Sales recorded for ${formatBusinessDate(businessDate)}`}
+                icon={<Package size={19} />}
+                accent="amber"
+              />
+              <SummaryCard
+                label="Today's Collection"
+                value={formatMetric(dailyCollection, dataLoading, dataStale)}
+                detail={`Collections received on ${formatBusinessDate(businessDate)}`}
+                icon={<Banknote size={19} />}
+                accent="emerald"
+              />
+            </div>
+            <p className="mt-3 text-xs leading-5 text-[#838c85]">
+              Date convention: Device local business date. Today&apos;s Sales reflects sales booked on the date; Today&apos;s Collection includes spot payments received at sale time plus standalone payments received on that date.
+            </p>
           </section>
 
           <section id="customers" className="mt-9">
@@ -609,7 +704,9 @@ export default function Home() {
                 <div className="flex items-center gap-2">
                   <h3 className="text-lg font-semibold tracking-[-0.025em]">Customers</h3>
                   <span className="rounded-full bg-[#e9eee8] px-2 py-0.5 text-xs font-semibold text-[#607165]">
-                    {customers.length}
+                    {dataStale || dashboardData?.totalCustomers == null
+                      ? "—"
+                      : dashboardData.totalCustomers}
                   </span>
                 </div>
                 <p className="mt-1 text-sm text-[#838c85]">
@@ -635,19 +732,12 @@ export default function Home() {
                   onClick={() => openModal("customer")}
                 >
                   <Plus size={16} />
-                  Add customer
+                  Add Customer
                 </button>
               </div>
             </div>
 
             <div className="mt-5 overflow-hidden rounded-2xl border border-[#e9ebe6] bg-white">
-              <div className="hidden grid-cols-[minmax(200px,1.3fr)_minmax(150px,1fr)_minmax(140px,1fr)_120px_105px] gap-4 border-b border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-[10px] font-semibold uppercase tracking-[0.15em] text-[#969e97] md:grid">
-                <span>Customer</span>
-                <span>Phone number</span>
-                <span>Address</span>
-                <span className="text-right">Pending balance</span>
-                <span />
-              </div>
               {dataLoading && customers.length === 0 ? (
                 <div className="flex items-center justify-center gap-2 px-5 py-14 text-sm text-[#7c867e]">
                   <LoaderCircle size={17} className="animate-spin" />
@@ -678,73 +768,96 @@ export default function Home() {
                   )}
                 </div>
               ) : (
-                <div className="divide-y divide-[#eef0eb]">
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[1050px] border-collapse text-left">
+                    <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
+                      <tr className="text-[10px] font-semibold uppercase tracking-[0.13em] text-[#969e97]">
+                        <th className="px-5 py-3">Customer Name</th>
+                        <th className="px-4 py-3">Contact &amp; Area</th>
+                        <th className="px-4 py-3 text-right">Total Billed</th>
+                        <th className="px-4 py-3 text-right">Total Paid</th>
+                        <th className="px-4 py-3 text-right">Balance / பாக்கி</th>
+                        <th className="px-5 py-3">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#eef0eb]">
                   {visibleCustomers.map((customer) => (
-                    <div
+                    <tr
                       key={customer.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => openModal("ledger", customer)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          openModal("ledger", customer);
-                        }
-                      }}
-                      className="grid cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-4 transition hover:bg-[#fbfcfa] sm:px-5 md:grid-cols-[minmax(200px,1.3fr)_minmax(150px,1fr)_minmax(140px,1fr)_120px_105px] md:gap-4"
+                      className="transition hover:bg-[#fbfcfa]"
                     >
-                      <div className="flex min-w-0 items-center gap-3">
-                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#edf3ec] text-sm font-semibold text-[#52755a]">
-                          {customer.name.trim().charAt(0).toUpperCase()}
-                        </span>
-                        <div className="min-w-0">
-                          <p className="truncate text-sm font-semibold text-[#29382e]">
+                      <td className="px-5 py-4">
+                        <div className="flex items-center gap-3">
+                          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#edf3ec] text-sm font-semibold text-[#52755a]">
+                            {customer.name.trim().charAt(0).toUpperCase()}
+                          </span>
+                          <span className="text-sm font-semibold text-[#29382e]">
                             {customer.name}
-                          </p>
-                          <p className="mt-0.5 text-xs text-[#9aa19b] md:hidden">
-                            {customer.phone || "No phone"}
-                          </p>
+                          </span>
                         </div>
-                      </div>
-                      <span className="hidden truncate text-sm text-[#78827a] md:block">
-                        {customer.phone || "—"}
-                      </span>
-                      <span className="hidden truncate text-sm text-[#78827a] md:block">
-                        {customer.address || "—"}
-                      </span>
-                      <span className="text-right">
-                        <span
-                          className={`block text-sm font-semibold ${
-                            customer.pending_balance > 0
-                              ? "text-red-600"
-                              : "text-[#5b7960]"
-                          }`}
-                        >
-                          {formatMoney(customer.pending_balance)}
+                      </td>
+                      <td className="px-4 py-4">
+                        <span className="block text-sm text-[#59685d]">
+                          {customer.phone || "No phone"}
                         </span>
-                        <span className="mt-0.5 block text-[10px] text-[#a0a79f] md:hidden">
-                          pending
+                        <span className="mt-1 block max-w-[200px] truncate text-xs text-[#929a93]">
+                          {customer.address || "Area not provided"}
                         </span>
-                      </span>
-                      <span className="hidden justify-end md:flex">
-                        <button
-                          type="button"
-                          className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e] hover:bg-[#eef4ee]"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            openModal("ledger", customer);
-                          }}
-                        >
-                          Ledger <ChevronRight size={14} />
-                        </button>
-                      </span>
-                    </div>
+                      </td>
+                      <td className="px-4 py-4 text-right text-sm text-[#59685d]">
+                        {formatOptionalMoney(customer.total_billed)}
+                      </td>
+                      <td className="px-4 py-4 text-right text-sm text-[#59685d]">
+                        {formatOptionalMoney(customer.total_paid)}
+                      </td>
+                      <td
+                        className={`px-4 py-4 text-right text-sm font-bold ${
+                          customer.pending_balance != null &&
+                          customer.pending_balance > 0
+                            ? "text-red-600"
+                            : customer.pending_balance == null
+                              ? "text-[#8b938d]"
+                              : "text-emerald-700"
+                        }`}
+                      >
+                        {formatOptionalMoney(customer.pending_balance)}
+                      </td>
+                      <td className="px-5 py-4">
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            className="rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e] hover:bg-[#eef4ee]"
+                            disabled={
+                              customer.pending_balance == null ||
+                              customer.pending_balance <= 0
+                            }
+                            onClick={() => openModal("payment", customer)}
+                          >
+                            Receive
+                          </button>
+                          <button
+                            type="button"
+                            className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e] hover:bg-[#eef4ee]"
+                            onClick={() => openModal("ledger", customer)}
+                          >
+                            <BookOpen size={14} /> Ledger
+                          </button>
+                          <WhatsAppReminder customer={customer} />
+                        </div>
+                      </td>
+                    </tr>
                   ))}
+                    </tbody>
+                  </table>
                 </div>
               )}
               <div className="flex items-center justify-between border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-xs text-[#8d968e]">
                 <span>
-                  Showing {visibleCustomers.length} of {customers.length} customers
+                  {dataStale
+                    ? `Showing ${visibleCustomers.length} customers from the last successful refresh`
+                    : dashboardData && !dashboardData.customersComplete
+                    ? `Showing ${visibleCustomers.length} customers; full customer count unavailable`
+                    : `Showing ${visibleCustomers.length} of ${dashboardData?.totalCustomers ?? 0} customers`}
                 </span>
                 {dataLoading && (
                   <LoaderCircle size={14} className="animate-spin text-[#78927d]" />
@@ -752,6 +865,21 @@ export default function Home() {
               </div>
             </div>
           </section>
+
+          {dashboardData?.salesAvailable && !dataStale && (
+            <section className="mt-9 grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,0.8fr)]">
+              <SalesTrend
+                businessDate={businessDate}
+                dailyTotals={dashboardData.dailyTotals}
+                available={dashboardData.salesComplete}
+              />
+              <RecentSales
+                sales={dashboardData.recentSales}
+                customers={customers}
+                complete={dashboardData.salesComplete}
+              />
+            </section>
+          )}
 
           <footer className="mt-8 flex flex-col gap-2 border-t border-[#e7eae4] pt-5 text-xs text-[#929a93] sm:flex-row sm:items-center sm:justify-between">
             <span>Simple books. Strong roots.</span>
@@ -782,8 +910,13 @@ export default function Home() {
                   className={inputClass}
                   name="phone"
                   type="tel"
-                  maxLength={30}
-                  placeholder="+91 98765 43210"
+                  inputMode="numeric"
+                  pattern="[0-9]{10}"
+                  minLength={10}
+                  maxLength={10}
+                  required
+                  title="Enter a 10-digit phone number."
+                  placeholder="9876543210"
                 />
               </Field>
               <Field label="Address">
@@ -866,6 +999,45 @@ function BrandMark() {
   );
 }
 
+function WhatsAppReminder({ customer }: { customer: Customer }) {
+  const digits = (customer.phone ?? "").replace(/\D/g, "");
+  const phone =
+    digits.length === 10
+      ? `91${digits}`
+      : digits.length === 12 && digits.startsWith("91")
+        ? digits
+        : null;
+  const message = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatOptionalMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
+
+  if (!phone || customer.pending_balance === null) {
+    return (
+      <button
+        type="button"
+        className="rounded-lg px-2 py-1.5 text-xs font-semibold text-[#a0a79f]"
+        disabled
+        title={
+          customer.pending_balance === null
+            ? "The current balance is unavailable."
+            : "A valid 10-digit phone number is required for WhatsApp."
+        }
+      >
+        WhatsApp
+      </button>
+    );
+  }
+
+  return (
+    <a
+      className="rounded-lg px-2 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
+      href={`https://wa.me/${phone}?text=${encodeURIComponent(message)}`}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      WhatsApp
+    </a>
+  );
+}
+
 function SummaryCard({
   label,
   value,
@@ -878,30 +1050,242 @@ function SummaryCard({
   value: string;
   detail: string;
   icon: React.ReactNode;
-  accent: "green" | "cream" | "sage";
+  accent: "red" | "emerald" | "amber" | "green";
   className?: string;
 }) {
   const accents = {
-    green: "bg-[#edf4eb] text-[#52795a]",
-    cream: "bg-[#f5f0e7] text-[#9a7c4c]",
-    sage: "bg-[#edf1f1] text-[#648080]",
+    red: "bg-red-50 text-red-600 border-red-100",
+    emerald: "bg-emerald-50 text-emerald-700 border-emerald-100",
+    amber: "bg-amber-50 text-amber-700 border-amber-100",
+    green: "bg-[#edf4eb] text-[#3e6849] border-[#d8e5d6]",
   };
 
   return (
     <article
-      className={`rounded-2xl border border-[#e9ebe6] bg-white p-5 sm:p-5.5 ${className}`}
+      className={`group relative overflow-hidden rounded-2xl border border-[#e8ece5] bg-white p-5 transition-all duration-200 hover:border-[#ccd4c9] hover:shadow-[0_4px_20px_rgba(25,45,32,0.05)] sm:p-5.5 ${className}`}
     >
       <div className="flex items-start justify-between">
-        <p className="text-sm font-medium text-[#747f77]">{label}</p>
-        <span className={`flex h-9 w-9 items-center justify-center rounded-xl ${accents[accent]}`}>
+        <p className="text-xs font-semibold uppercase tracking-wider text-[#738076]">{label}</p>
+        <span className={`flex h-9 w-9 items-center justify-center rounded-xl border transition-transform duration-200 group-hover:scale-105 ${accents[accent]}`}>
           {icon}
         </span>
       </div>
-      <p className="mt-3 text-[27px] font-semibold tracking-[-0.045em] text-[#26362c]">
+      <p className="mt-3 text-[27px] font-semibold tracking-[-0.04em] text-[#243329]">
         {value}
       </p>
-      <p className="mt-1 text-xs text-[#929a93]">{detail}</p>
+      <div className="mt-2 flex items-center gap-1.5 border-t border-[#f2f4ef] pt-2 text-[11px] text-[#869088]">
+        <span>{detail}</span>
+      </div>
     </article>
+  );
+}
+
+function SalesTrend({
+  businessDate,
+  dailyTotals,
+  available,
+}: {
+  businessDate: string;
+  dailyTotals: Record<string, DailyTotals>;
+  available: boolean;
+}) {
+  const lastDate = new Date(`${businessDate}T12:00:00`);
+  const dates = Array.from({ length: 14 }, (_, index) => {
+    const date = new Date(lastDate);
+    date.setDate(lastDate.getDate() - (13 - index));
+    return getBusinessDate(date);
+  });
+  const points = dates.map((date) => ({
+    date,
+    amount: dailyTotals[date]?.sales ?? 0,
+  }));
+  const highest = Math.max(...points.map((point) => point.amount), 1);
+  const total = points.reduce((sum, point) => sum + point.amount, 0);
+
+  return (
+    <section
+      aria-labelledby="sales-trend-heading"
+      className="rounded-2xl border border-[#e8ece5] bg-white p-5 shadow-[0_2px_8px_rgba(24,40,30,0.03)] sm:p-6"
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <h2
+              id="sales-trend-heading"
+              className="text-base font-semibold tracking-[-0.02em] text-[#29382e]"
+            >
+              Sales overview
+            </h2>
+            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+              14-Day Trend
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-[#838c85]">Daily billed sales revenue from real database transactions</p>
+        </div>
+        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-50 text-amber-700">
+          <BarChart3 size={18} />
+        </span>
+      </div>
+      {!available ? (
+        <div className="mt-6 rounded-xl border border-dashed border-[#e2e6df] bg-[#fafbf9] px-4 py-8 text-center text-sm text-[#7b847e]">
+          Sales history is incomplete, so a reliable trend cannot be displayed.
+        </div>
+      ) : total === 0 ? (
+        <div className="mt-6 rounded-xl border border-dashed border-[#e2e6df] bg-[#fafbf9] px-4 py-8 text-center text-sm text-[#7b847e]">
+          No sales are recorded in this 14-day window ending {formatDate(businessDate)}.
+        </div>
+      ) : (
+        <>
+          <div className="mt-6 flex items-end justify-between gap-1.5 border-b border-l border-[#edf0eb] px-1 pb-2 pt-2 sm:gap-2 sm:px-2">
+            {points.map((point) => {
+              const label = new Intl.DateTimeFormat("en-IN", {
+                day: "numeric",
+                month: "short",
+              }).format(new Date(`${point.date}T12:00:00`));
+              const isSelectedDate = point.date === businessDate;
+              return (
+                <div
+                  key={point.date}
+                  className="group relative flex min-w-0 flex-1 flex-col items-center justify-end"
+                  title={`${label}: ${formatMoney(point.amount)}`}
+                >
+                  <div className="flex h-36 w-full items-end justify-center">
+                    <span
+                      aria-label={`${label}: ${formatMoney(point.amount)}`}
+                      className={`w-[min(65%,24px)] rounded-t-md transition-all duration-200 ${
+                        point.amount > 0
+                          ? isSelectedDate
+                            ? "bg-[#285d42] group-hover:bg-[#1b432e]"
+                            : "bg-[#6d9f75] group-hover:bg-[#437852]"
+                          : "bg-[#edf1eb]"
+                      }`}
+                      style={{
+                        height: `${Math.max(
+                          point.amount > 0 ? 6 : 2,
+                          (point.amount / highest) * 100,
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                  {([0, 4, 8, 13].includes(
+                    points.findIndex((candidate) => candidate.date === point.date),
+                  )) ? (
+                    <span
+                      className={`mt-2 whitespace-nowrap text-[9px] font-medium ${
+                        isSelectedDate ? "font-bold text-[#285d42]" : "text-[#879188]"
+                      }`}
+                    >
+                      {label}
+                    </span>
+                  ) : (
+                    <span className="mt-2 text-[9px] text-transparent" aria-hidden="true">
+                      ·
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-[#f8faf7] px-3.5 py-2.5 text-xs text-[#6e7a71]">
+            <span className="flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-[#285d42]" />
+              14-day cumulative volume
+            </span>
+            <span className="font-semibold text-[#2b3e30]">{formatMoney(total)}</span>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function RecentSales({
+  sales,
+  customers,
+  complete,
+}: {
+  sales: CustomerSummaryResult["recentSales"];
+  customers: Customer[];
+  complete: boolean;
+}) {
+  const customerNames = new Map(
+    customers.map((customer) => [customer.id, customer.name]),
+  );
+
+  return (
+    <section
+      aria-labelledby="recent-sales-heading"
+      className="overflow-hidden rounded-2xl border border-[#e8ece5] bg-white shadow-[0_2px_8px_rgba(24,40,30,0.03)]"
+    >
+      <div className="flex items-start justify-between gap-4 px-5 py-5 sm:px-6">
+        <div>
+          <div className="flex items-center gap-2">
+            <h2
+              id="recent-sales-heading"
+              className="text-base font-semibold tracking-[-0.02em] text-[#29382e]"
+            >
+              Recent sales
+            </h2>
+            <span className="rounded-full bg-[#edf4eb] px-2 py-0.5 text-[10px] font-semibold text-[#456c4e]">
+              Latest Entries
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-[#838c85]">
+            Chronological sale entries with billed totals and balances
+          </p>
+        </div>
+        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#edf4eb] text-[#52795a]">
+          <ShoppingBag size={18} />
+        </span>
+      </div>
+      {!complete && (
+        <p className="border-y border-amber-100 bg-amber-50 px-5 py-2.5 text-xs leading-5 text-amber-800">
+          Showing the newest available entries only. All-time totals are withheld
+          because the sales history exceeds the safe read limit.
+        </p>
+      )}
+      {sales.length === 0 ? (
+        <div className="border-t border-[#eef0eb] px-5 py-10 text-center text-sm text-[#7b847e]">
+          No sales have been recorded yet.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[480px] text-left">
+            <thead className="border-y border-[#eef0eb] bg-[#fbfcfa]">
+              <tr className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#969e97]">
+                <th className="px-5 py-2.5">Date · Customer</th>
+                <th className="px-3 py-2.5 text-right">Billed</th>
+                <th className="px-5 py-2.5 text-right">Due / பாக்கி</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[#eef0eb]">
+              {sales.map((sale) => (
+                <tr key={sale.id} className="transition-colors hover:bg-[#fafbf9]">
+                  <td className="px-5 py-3">
+                    <span className="block text-xs font-semibold text-[#37463a]">
+                      {customerNames.get(sale.customer_id) ?? "Customer"}
+                    </span>
+                    <span className="mt-0.5 block text-[10px] text-[#929b93]">
+                      {formatDate(sale.sale_date)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-right text-xs font-medium text-[#4b5a4f]">
+                    {formatMoney(Number(sale.total_amount))}
+                  </td>
+                  <td
+                    className={`px-5 py-3 text-right text-xs font-semibold ${
+                      Number(sale.balance) > 0 ? "text-red-600" : "text-emerald-700"
+                    }`}
+                  >
+                    {formatMoney(Number(sale.balance))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1053,7 +1437,7 @@ function CustomerSelect({
           <option key={customer.id} value={customer.id}>
             {customer.name}
             {includeBalances
-              ? ` · ${formatMoney(customer.pending_balance)} due`
+              ? ` · ${formatOptionalMoney(customer.pending_balance)} due`
               : ""}
           </option>
         ))}
@@ -1253,7 +1637,12 @@ function PaymentForm({
   onCancel: () => void;
   initialCustomerId: string;
 }) {
-  const eligibleCustomers = customers.filter((item) => item.pending_balance > 0);
+  const eligibleCustomers = customers.filter(
+    (item) => item.pending_balance !== null && item.pending_balance > 0,
+  );
+  const balancesUnavailable = customers.some(
+    (item) => item.pending_balance === null,
+  );
   const [customerId, setCustomerId] = useState(initialCustomerId);
   const customer = customers.find((item) => item.id === customerId);
 
@@ -1263,7 +1652,9 @@ function PaymentForm({
         <ErrorNotice>
           {customers.length === 0
             ? "Add a customer before recording a payment."
-            : "There are no customers with pending dues."}
+            : balancesUnavailable
+              ? "Customer balances are unavailable. Refresh the dashboard before recording a payment."
+              : "There are no customers with pending dues."}
         </ErrorNotice>
       )}
       <Field label="Customer" required>
@@ -1278,7 +1669,7 @@ function PaymentForm({
         <div className="flex items-center justify-between rounded-xl bg-[#f6f8f4] px-3.5 py-3 text-sm">
           <span className="text-[#748077]">Current pending balance</span>
           <span className="font-semibold text-[#8b6139]">
-            {formatMoney(customer.pending_balance)}
+            {formatOptionalMoney(customer.pending_balance)}
           </span>
         </div>
       )}
@@ -1298,7 +1689,7 @@ function PaymentForm({
             type="number"
             name="amount"
             min="0.01"
-            max={customer?.pending_balance}
+            max={customer?.pending_balance ?? undefined}
             step="0.01"
             required
             placeholder="0.00"
@@ -1339,8 +1730,8 @@ function LedgerView({
       : phoneDigits.startsWith("0") && phoneDigits.length === 11
         ? `91${phoneDigits.slice(1)}`
         : phoneDigits;
-  const whatsappMessage = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
-  const whatsappHref = whatsappPhone
+  const whatsappMessage = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatOptionalMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
+  const whatsappHref = whatsappPhone && customer.pending_balance !== null
     ? `https://wa.me/${whatsappPhone}?text=${encodeURIComponent(whatsappMessage)}`
     : null;
   const balancesById = new Map<string, number>();
@@ -1370,7 +1761,7 @@ function LedgerView({
             Pending
           </p>
           <p className="mt-1 text-sm font-semibold text-red-600">
-            {formatMoney(customer.pending_balance)}
+            {formatOptionalMoney(customer.pending_balance)}
           </p>
         </div>
       </div>
@@ -1378,7 +1769,9 @@ function LedgerView({
         <button
           type="button"
           className={primaryButton}
-          disabled={customer.pending_balance <= 0}
+          disabled={
+            customer.pending_balance === null || customer.pending_balance <= 0
+          }
           onClick={onReceivePayment}
         >
           <Banknote size={16} />
