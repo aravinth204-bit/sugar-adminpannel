@@ -441,6 +441,30 @@ export async function addCustomer(input: {
   return requireData(data, error);
 }
 
+export async function updateCustomer(input: {
+  id: string;
+  name: string;
+  phone?: string | null;
+  address?: string | null;
+}): Promise<Database["public"]["Tables"]["customers"]["Row"]> {
+  const name = input.name.trim();
+  if (!name) throw new Error("Customer name is required.");
+  if (!input.id) throw new Error("Customer ID is required.");
+
+  const { data, error } = await getSupabaseClient()
+    .from("customers")
+    .update({
+      name,
+      phone: input.phone ? input.phone.trim() : null,
+      address: input.address ? input.address.trim() : null,
+    })
+    .eq("id", input.id)
+    .select("id, name, phone, address, created_at")
+    .single();
+
+  return requireData(data, error);
+}
+
 export async function addDailySale(input: {
   customerId: string;
   saleUnit: "500g" | "1kg" | "bulk";

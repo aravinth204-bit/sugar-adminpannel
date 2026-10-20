@@ -6,15 +6,20 @@ import {
   Banknote,
   BarChart3,
   BookOpen,
+  Calendar,
   Check,
   ChevronDown,
   CircleHelp,
   ClipboardList,
+  Edit,
+  Eye,
   IndianRupee,
   LoaderCircle,
   LogOut,
+  MapPin,
   Menu,
   MessageCircle,
+  Phone,
   Plus,
   Package,
   RefreshCw,
@@ -45,6 +50,7 @@ import {
 } from "@/lib/supabase";
 import {
   createCustomer,
+  editCustomer,
   getCustomersWithBalance,
 } from "@/lib/db";
 
@@ -92,7 +98,7 @@ function today() {
   return getBusinessDate();
 }
 
-type ModalKind = "customer" | "sale" | "payment" | "ledger" | null;
+type ModalKind = "customer" | "edit-customer" | "customer-details" | "sale" | "payment" | "ledger" | null;
 
 export default function Home() {
   const [configured, setConfigured] = useState(true);
@@ -110,6 +116,7 @@ export default function Home() {
   const [dataLoading, setDataLoading] = useState(false);
   const [dataError, setDataError] = useState("");
   const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "due" | "settled" | "no-sales">("all");
   const [modal, setModal] = useState<ModalKind>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
@@ -117,7 +124,8 @@ export default function Home() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
-  const [mobileMenu, setMobileMenu] = useState(false); // eslint-disable-line no-unused-vars
+  const [activeTab, setActiveTab] = useState<"overview" | "customers" | "sales">("overview");
+  const [mobileMenu, setMobileMenu] = useState(false);
 
   useEffect(() => {
     let supabase: ReturnType<typeof getSupabaseClient>;
@@ -175,14 +183,34 @@ export default function Home() {
 
   const visibleCustomers = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    if (!normalizedQuery) return customers;
-    return customers.filter((customer) =>
-      [customer.name, customer.phone ?? "", customer.address ?? ""]
-        .join(" ")
-        .toLowerCase()
-        .includes(normalizedQuery),
-    );
-  }, [customers, query]);
+    return customers.filter((customer) => {
+      const matchesQuery =
+        !normalizedQuery ||
+        [customer.name, customer.phone ?? "", customer.address ?? ""]
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedQuery);
+      if (!matchesQuery) return false;
+
+      if (statusFilter === "due") {
+        return customer.pending_balance !== null && customer.pending_balance > 0;
+      }
+      if (statusFilter === "settled") {
+        return (
+          customer.total_billed !== null &&
+          customer.total_billed > 0 &&
+          customer.pending_balance === 0
+        );
+      }
+      if (statusFilter === "no-sales") {
+        return (
+          customer.total_billed === 0 ||
+          (customer.total_billed === null && customer.pending_balance === null)
+        );
+      }
+      return true;
+    });
+  }, [customers, query, statusFilter]);
 
   const dailyTotals: DailyTotals | undefined =
     dashboardData?.dailyTotals[businessDate];
@@ -229,13 +257,13 @@ export default function Home() {
     setSuccessMessage("");
     setSelectedCustomer(customer ?? null);
     setModal(kind);
-    if (kind === "ledger" && customer) {
+    if ((kind === "ledger" || kind === "customer-details") && customer) {
       setLedgerLoading(true);
       void fetchCustomerLedger(customer.id)
         .then(setLedger)
         .catch((error: unknown) => {
           setFormError(
-            error instanceof Error ? error.message : "Unable to load the ledger.",
+            error instanceof Error ? error.message : "Unable to load transaction history.",
           );
         })
         .finally(() => setLedgerLoading(false));
@@ -283,6 +311,48 @@ export default function Home() {
       );
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Unable to add customer.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleEditCustomer(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedCustomer) return;
+    setSaving(true);
+    setFormError("");
+    const form = new FormData(event.currentTarget);
+    try {
+      const updated = await editCustomer({
+        id: selectedCustomer.id,
+        name: String(form.get("name") ?? ""),
+        phone: String(form.get("phone") ?? ""),
+        address: String(form.get("address") ?? ""),
+      });
+      const refreshed = await refreshCustomers();
+      setCustomers((current) =>
+        current.map((cust) =>
+          cust.id === updated.id
+            ? {
+                ...cust,
+                name: updated.name,
+                phone: updated.phone,
+                address: updated.address,
+              }
+            : cust,
+        ),
+      );
+      setModal(null);
+      setSelectedCustomer(null);
+      setSuccessMessage(
+        refreshed
+          ? "Customer details updated successfully."
+          : "Customer details updated.",
+      );
+    } catch (error) {
+      setFormError(
+        error instanceof Error ? error.message : "Unable to update customer details.",
+      );
     } finally {
       setSaving(false);
     }
@@ -467,30 +537,51 @@ export default function Home() {
           <p className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-[#a0a79f]">
             Workspace
           </p>
-          <a
-            href="#overview"
-            onClick={() => setMobileMenu(false)}
-            className="flex items-center gap-3 rounded-xl bg-[#eef4ee] px-3 py-2.5 text-sm font-semibold text-[#285d42]"
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab("overview");
+              setMobileMenu(false);
+            }}
+            className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold transition ${
+              activeTab === "overview"
+                ? "bg-[#eef4ee] text-[#285d42]"
+                : "text-[#717b74] hover:bg-[#f7f8f5] hover:text-[#25372c]"
+            }`}
           >
             <ClipboardList size={18} strokeWidth={1.8} />
             Overview
-          </a>
-          <a
-            href="#customers"
-            onClick={() => setMobileMenu(false)}
-            className="mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-[#717b74] transition hover:bg-[#f7f8f5] hover:text-[#25372c]"
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab("customers");
+              setMobileMenu(false);
+            }}
+            className={`mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+              activeTab === "customers"
+                ? "bg-[#eef4ee] text-[#285d42] font-semibold"
+                : "text-[#717b74] hover:bg-[#f7f8f5] hover:text-[#25372c]"
+            }`}
           >
             <Users size={18} strokeWidth={1.8} />
             Customers
-          </a>
-          <a
-            href="#sales"
-            onClick={() => setMobileMenu(false)}
-            className="mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-[#717b74] transition hover:bg-[#f7f8f5] hover:text-[#25372c] bg-[#eef4ee]"
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab("sales");
+              setMobileMenu(false);
+            }}
+            className={`mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+              activeTab === "sales"
+                ? "bg-[#eef4ee] text-[#285d42] font-semibold"
+                : "text-[#717b74] hover:bg-[#f7f8f5] hover:text-[#25372c]"
+            }`}
           >
             <ShoppingBag size={18} strokeWidth={1.8} />
             Sales
-          </a>
+          </button>
         </div>
 
         <div className="mt-auto">
@@ -579,13 +670,18 @@ export default function Home() {
           >
             <div>
               <h2 className="mt-2 text-[27px] font-semibold tracking-[-0.045em] sm:text-[34px]">
-                Daily Packet Sales &amp; Customer Ledger
+                {activeTab === "overview" && "Daily Packet Sales & Customer Ledger"}
+                {activeTab === "customers" && "Customer Directory & Balances"}
+                {activeTab === "sales" && "Sales Trends & Recent Transactions"}
               </h2>
               <p className="mt-1.5 max-w-xl text-sm leading-6 text-[#7b847e]">
-                Manage customers, track khata balances, and keep your sales records current.
+                {activeTab === "overview" && "Manage customers, track khata balances, and keep your sales records current."}
+                {activeTab === "customers" && "Search customer records, add new customers, and collect pending khata dues."}
+                {activeTab === "sales" && "Track daily revenue trends, packet volume, and recent sales transactions."}
               </p>
             </div>
           </section>
+
 
           {successMessage && (
             <div className="mt-6 flex items-center justify-between rounded-xl border border-[#dceade] bg-[#f0f7f0] px-4 py-3 text-sm text-[#356347]">
@@ -615,98 +711,101 @@ export default function Home() {
             </div>
           )}
 
-          <section aria-label="Dashboard summary" className="mt-8">
-            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]">
-                    Business overview
-                  </h2>
-                  <span className="rounded-full bg-[#edf4eb] px-2.5 py-0.5 text-[11px] font-medium text-[#40684b]">
-                    Live Metrics
-                  </span>
+          {activeTab === "overview" && (
+            <section aria-label="Dashboard summary" className="mt-8">
+              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]">
+                      Business overview
+                    </h2>
+                    <span className="rounded-full bg-[#edf4eb] px-2.5 py-0.5 text-[11px] font-medium text-[#40684b]">
+                      Live Metrics
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-[#838c85]">
+                    All-time totals and daily operational figures are kept strictly distinct.
+                  </p>
                 </div>
-                <p className="mt-1 text-xs text-[#838c85]">
-                  All-time totals and daily operational figures are kept strictly distinct.
-                </p>
+                <div className="flex items-center gap-2">
+                  <label className="flex items-center text-xs font-medium text-[#69766c]">
+                    Business date
+                    <input
+                      className="ml-2 h-9 rounded-lg border border-[#e2e6df] bg-white px-2.5 text-sm font-medium text-[#34443a] outline-none transition focus:border-[#8eae94] focus:ring-2 focus:ring-[#e7f0e7]"
+                      type="date"
+                      value={businessDate}
+                      onChange={(event) => setBusinessDate(event.target.value)}
+                    />
+                  </label>
+                  {businessDate !== today() && (
+                    <button
+                      type="button"
+                      onClick={() => setBusinessDate(today())}
+                      className="h-9 rounded-lg border border-[#e2e6df] bg-white px-2.5 text-xs font-semibold text-[#285d42] transition hover:bg-[#edf4eb]"
+                    >
+                      Today
+                    </button>
+                  )}
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <label className="flex items-center text-xs font-medium text-[#69766c]">
-                  Business date
-                  <input
-                    className="ml-2 h-9 rounded-lg border border-[#e2e6df] bg-white px-2.5 text-sm font-medium text-[#34443a] outline-none transition focus:border-[#8eae94] focus:ring-2 focus:ring-[#e7f0e7]"
-                    type="date"
-                    value={businessDate}
-                    onChange={(event) => setBusinessDate(event.target.value)}
-                  />
-                </label>
-                {businessDate !== today() && (
-                  <button
-                    type="button"
-                    onClick={() => setBusinessDate(today())}
-                    className="h-9 rounded-lg border border-[#e2e6df] bg-white px-2.5 text-xs font-semibold text-[#285d42] transition hover:bg-[#edf4eb]"
-                  >
-                    Today
-                  </button>
-                )}
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                <SummaryCard
+                  label="Total Sales"
+                  value={formatMetric(dashboardData?.totalBilled, dataLoading, dataStale)}
+                  detail="All-time billed sales value"
+                  icon={<Package size={19} />}
+                  accent="amber"
+                />
+                <SummaryCard
+                  label="Total Collected"
+                  value={formatMetric(dashboardData?.totalPaid, dataLoading, dataStale)}
+                  detail="Sale receipts + khata collections"
+                  icon={<Banknote size={19} />}
+                  accent="emerald"
+                />
+                <SummaryCard
+                  label="Outstanding Due"
+                  value={formatMetric(dashboardData?.outstanding, dataLoading, dataStale)}
+                  detail="All-time balance pending recovery"
+                  icon={<IndianRupee size={19} />}
+                  accent="red"
+                />
+                <SummaryCard
+                  label="Total Customers"
+                  value={
+                    dataLoading
+                      ? "Refreshing…"
+                      : dataStale || dashboardData?.totalCustomers == null
+                      ? "Unavailable"
+                      : dashboardData.totalCustomers.toLocaleString("en-IN")
+                  }
+                  detail="Active customers in khata register"
+                  icon={<Users size={19} />}
+                  accent="green"
+                />
+                <SummaryCard
+                  label="Today's Sales"
+                  value={formatMetric(dailySales, dataLoading, dataStale)}
+                  detail={`Sales recorded for ${formatBusinessDate(businessDate)}`}
+                  icon={<Package size={19} />}
+                  accent="amber"
+                />
+                <SummaryCard
+                  label="Today's Collection"
+                  value={formatMetric(dailyCollection, dataLoading, dataStale)}
+                  detail={`Collections received on ${formatBusinessDate(businessDate)}`}
+                  icon={<Banknote size={19} />}
+                  accent="emerald"
+                />
               </div>
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-              <SummaryCard
-                label="Total Sales"
-                value={formatMetric(dashboardData?.totalBilled, dataLoading, dataStale)}
-                detail="All-time billed sales value"
-                icon={<Package size={19} />}
-                accent="amber"
-              />
-              <SummaryCard
-                label="Total Collected"
-                value={formatMetric(dashboardData?.totalPaid, dataLoading, dataStale)}
-                detail="Sale receipts + khata collections"
-                icon={<Banknote size={19} />}
-                accent="emerald"
-              />
-              <SummaryCard
-                label="Outstanding Due"
-                value={formatMetric(dashboardData?.outstanding, dataLoading, dataStale)}
-                detail="All-time balance pending recovery"
-                icon={<IndianRupee size={19} />}
-                accent="red"
-              />
-              <SummaryCard
-                label="Total Customers"
-                value={
-                  dataLoading
-                    ? "Refreshing…"
-                    : dataStale || dashboardData?.totalCustomers == null
-                    ? "Unavailable"
-                    : dashboardData.totalCustomers.toLocaleString("en-IN")
-                }
-                detail="Active customers in khata register"
-                icon={<Users size={19} />}
-                accent="green"
-              />
-              <SummaryCard
-                label="Today's Sales"
-                value={formatMetric(dailySales, dataLoading, dataStale)}
-                detail={`Sales recorded for ${formatBusinessDate(businessDate)}`}
-                icon={<Package size={19} />}
-                accent="amber"
-              />
-              <SummaryCard
-                label="Today's Collection"
-                value={formatMetric(dailyCollection, dataLoading, dataStale)}
-                detail={`Collections received on ${formatBusinessDate(businessDate)}`}
-                icon={<Banknote size={19} />}
-                accent="emerald"
-              />
-            </div>
-            <p className="mt-3 text-xs leading-5 text-[#838c85]">
-              Date convention: Device local business date. Today&apos;s Sales reflects sales booked on the date; Today&apos;s Collection includes spot payments received at sale time plus standalone payments received on that date.
-            </p>
-          </section>
+              <p className="mt-3 text-xs leading-5 text-[#838c85]">
+                Date convention: Device local business date. Today&apos;s Sales reflects sales booked on the date; Today&apos;s Collection includes spot payments received at sale time plus standalone payments received on that date.
+              </p>
+            </section>
+          )}
 
-          <section id="customers" className="mt-9">
+          {activeTab === "customers" && (
+            <section id="customers" className="mt-8">
             <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
               <div>
                 <div className="flex items-center gap-2">
@@ -721,26 +820,109 @@ export default function Home() {
                   Keep track of your customer book and pending dues.
                 </p>
               </div>
-              <div className="flex flex-wrap gap-2.5">
-                <label className="relative min-w-[200px] flex-1 sm:min-w-[240px]">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                {/* Search Bar with clear button */}
+                <div className="relative min-w-[200px] flex-1 sm:min-w-[280px]">
                   <Search
                     size={16}
                     className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#959d96]"
                   />
                   <input
-                    className="h-10 w-full rounded-xl border border-[#e5e8e1] bg-white pl-10 pr-3 text-sm outline-none placeholder:text-[#a0a79f] focus:border-[#9ab59e]"
+                    className="h-10 w-full rounded-xl border border-[#e5e8e1] bg-white pl-10 pr-9 text-sm outline-none placeholder:text-[#a0a79f] focus:border-[#9ab59e] focus:ring-2 focus:ring-[#e7f0e7]"
                     value={query}
                     onChange={(event) => setQuery(event.target.value)}
-                    placeholder="Search customers"
+                    placeholder="Search by customer name, phone, or area…"
                   />
-                </label>
+                  {query && (
+                    <button
+                      type="button"
+                      aria-label="Clear search"
+                      onClick={() => setQuery("")}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 rounded-md p-1 text-[#9aa49d] hover:bg-[#f0f3ee] hover:text-[#334237]"
+                    >
+                      <X size={14} />
+                    </button>
+                  )}
+                </div>
+
+                {/* Status Filter Pills */}
+                <div className="flex items-center gap-1 overflow-x-auto rounded-xl border border-[#e5e9e2] bg-[#f8faf7] p-1">
+                  <button
+                    type="button"
+                    onClick={() => setStatusFilter("all")}
+                    className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                      statusFilter === "all"
+                        ? "bg-white text-[#285d42] shadow-sm"
+                        : "text-[#6d7970] hover:text-[#25372c]"
+                    }`}
+                  >
+                    All ({customers.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStatusFilter("due")}
+                    className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                      statusFilter === "due"
+                        ? "bg-white text-red-600 shadow-sm"
+                        : "text-[#6d7970] hover:text-red-600"
+                    }`}
+                  >
+                    Due (
+                    {
+                      customers.filter(
+                        (c) => c.pending_balance !== null && c.pending_balance > 0,
+                      ).length
+                    }
+                    )
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStatusFilter("settled")}
+                    className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                      statusFilter === "settled"
+                        ? "bg-white text-emerald-700 shadow-sm"
+                        : "text-[#6d7970] hover:text-emerald-700"
+                    }`}
+                  >
+                    Fully Paid (
+                    {
+                      customers.filter(
+                        (c) =>
+                          c.total_billed !== null &&
+                          c.total_billed > 0 &&
+                          c.pending_balance === 0,
+                      ).length
+                    }
+                    )
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStatusFilter("no-sales")}
+                    className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                      statusFilter === "no-sales"
+                        ? "bg-white text-[#526356] shadow-sm"
+                        : "text-[#6d7970] hover:text-[#25372c]"
+                    }`}
+                  >
+                    No Sales (
+                    {
+                      customers.filter(
+                        (c) =>
+                          c.total_billed === 0 ||
+                          (c.total_billed === null && c.pending_balance === null),
+                      ).length
+                    }
+                    )
+                  </button>
+                </div>
+
                 <button
                   type="button"
-                  className={secondaryButton}
+                  className={primaryButton}
                   onClick={() => openModal("customer")}
                 >
                   <Plus size={16} />
-                  Add Customer
+                  <span>Add Customer</span>
                 </button>
               </div>
             </div>
@@ -757,14 +939,28 @@ export default function Home() {
                     {query ? <Search size={21} /> : <Users size={21} />}
                   </div>
                   <p className="mt-4 text-sm font-semibold text-[#354139]">
-                    {query ? "No matching customers" : "Your customer book is empty"}
+                    {query || statusFilter !== "all"
+                      ? "No matching customers found"
+                      : "Your customer book is empty"}
                   </p>
                   <p className="mt-1 text-sm text-[#8a938c]">
-                    {query
-                      ? "Try another name, phone number, or address."
+                    {query || statusFilter !== "all"
+                      ? "Try adjusting your search terms or clearing the filter."
                       : "Add your first customer to start recording sales."}
                   </p>
-                  {!query && (
+                  {(query || statusFilter !== "all") && (
+                    <button
+                      type="button"
+                      className={`${secondaryButton} mt-4`}
+                      onClick={() => {
+                        setQuery("");
+                        setStatusFilter("all");
+                      }}
+                    >
+                      Clear search &amp; filters
+                    </button>
+                  )}
+                  {!query && statusFilter === "all" && (
                     <button
                       type="button"
                       className={`${secondaryButton} mt-4`}
@@ -776,88 +972,269 @@ export default function Home() {
                   )}
                 </div>
               ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full min-w-[1050px] border-collapse text-left">
-                    <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
-                      <tr className="text-[10px] font-semibold uppercase tracking-[0.13em] text-[#969e97]">
-                        <th className="px-5 py-3">Customer Name</th>
-                        <th className="px-4 py-3">Contact &amp; Area</th>
-                        <th className="px-4 py-3 text-right">Total Billed</th>
-                        <th className="px-4 py-3 text-right">Total Paid</th>
-                        <th className="px-4 py-3 text-right">Balance / பாக்கி</th>
-                        <th className="px-5 py-3">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[#eef0eb]">
-                  {visibleCustomers.map((customer) => (
-                    <tr
-                      key={customer.id}
-                      className="transition hover:bg-[#fbfcfa]"
-                    >
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-3">
-                          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#edf3ec] text-sm font-semibold text-[#52755a]">
-                            {customer.name.trim().charAt(0).toUpperCase()}
-                          </span>
-                          <span className="text-sm font-semibold text-[#29382e]">
-                            {customer.name}
-                          </span>
+                <>
+                  {/* Desktop Table View */}
+                  <div className="hidden overflow-x-auto lg:block">
+                    <table className="w-full min-w-[1000px] border-collapse text-left">
+                      <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
+                        <tr className="text-[10px] font-semibold uppercase tracking-[0.13em] text-[#969e97]">
+                          <th className="px-5 py-3">Customer Name</th>
+                          <th className="px-4 py-3">Contact &amp; Area</th>
+                          <th className="px-4 py-3 text-right">Total Billed</th>
+                          <th className="px-4 py-3 text-right">Total Paid</th>
+                          <th className="px-4 py-3 text-right">Balance / பாக்கி</th>
+                          <th className="px-4 py-3 text-center">Status</th>
+                          <th className="px-5 py-3 text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#eef0eb]">
+                        {visibleCustomers.map((customer) => {
+                          const hasDue =
+                            customer.pending_balance !== null &&
+                            customer.pending_balance > 0;
+                          const isSettled =
+                            customer.total_billed !== null &&
+                            customer.total_billed > 0 &&
+                            customer.pending_balance === 0;
+
+                          return (
+                            <tr
+                              key={customer.id}
+                              className="transition hover:bg-[#fafbf9]"
+                            >
+                              <td className="px-5 py-4">
+                                <div className="flex items-center gap-3">
+                                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#edf3ec] text-sm font-semibold text-[#52755a]">
+                                    {customer.name.trim().charAt(0).toUpperCase()}
+                                  </span>
+                                  <div>
+                                    <span className="block text-sm font-semibold text-[#29382e]">
+                                      {customer.name}
+                                    </span>
+                                    <span className="mt-0.5 block text-[11px] text-[#8e9891]">
+                                      Joined {formatDate(customer.created_at)}
+                                    </span>
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="px-4 py-4">
+                                <span className="block text-sm text-[#59685d]">
+                                  {customer.phone || (
+                                    <span className="italic text-[#a4aca6]">No phone</span>
+                                  )}
+                                </span>
+                                <span className="mt-0.5 block max-w-[200px] truncate text-xs text-[#929a93]">
+                                  {customer.address || "Area not provided"}
+                                </span>
+                              </td>
+                              <td className="px-4 py-4 text-right text-sm text-[#59685d]">
+                                {formatOptionalMoney(customer.total_billed)}
+                              </td>
+                              <td className="px-4 py-4 text-right text-sm text-[#59685d]">
+                                {formatOptionalMoney(customer.total_paid)}
+                              </td>
+                              <td
+                                className={`px-4 py-4 text-right text-sm font-bold ${
+                                  hasDue
+                                    ? "text-red-600"
+                                    : customer.pending_balance == null
+                                      ? "text-[#8b938d]"
+                                      : "text-emerald-700"
+                                }`}
+                              >
+                                {formatOptionalMoney(customer.pending_balance)}
+                              </td>
+                              <td className="px-4 py-4 text-center">
+                                {hasDue ? (
+                                  <span className="inline-block rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-semibold text-red-700">
+                                    Due
+                                  </span>
+                                ) : isSettled ? (
+                                  <span className="inline-block rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
+                                    Paid
+                                  </span>
+                                ) : (
+                                  <span className="inline-block rounded-full bg-[#edf0eb] px-2 py-0.5 text-[11px] font-medium text-[#717d74]">
+                                    No Sales
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-5 py-4 text-right">
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <button
+                                    type="button"
+                                    title="View Details & Khata"
+                                    className="flex items-center gap-1 rounded-lg border border-[#e2e7e0] bg-white px-2.5 py-1.5 text-xs font-semibold text-[#445248] transition hover:bg-[#f6f8f5]"
+                                    onClick={() => openModal("customer-details", customer)}
+                                  >
+                                    <Eye size={13} />
+                                    Details
+                                  </button>
+                                  <button
+                                    type="button"
+                                    title="Edit customer details"
+                                    className="rounded-lg p-1.5 text-[#6c7870] transition hover:bg-[#edf2eb] hover:text-[#285d42]"
+                                    onClick={() => openModal("edit-customer", customer)}
+                                  >
+                                    <Edit size={14} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="rounded-lg bg-[#edf4ed] px-2.5 py-1.5 text-xs font-semibold text-[#285d42] transition hover:bg-[#e2ede2] disabled:cursor-not-allowed disabled:opacity-40"
+                                    disabled={
+                                      customer.pending_balance == null ||
+                                      customer.pending_balance <= 0
+                                    }
+                                    onClick={() => openModal("payment", customer)}
+                                  >
+                                    Receive
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e] transition hover:bg-[#eef4ee]"
+                                    onClick={() => openModal("ledger", customer)}
+                                  >
+                                    <BookOpen size={14} /> Ledger
+                                  </button>
+                                  <WhatsAppReminder customer={customer} />
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Mobile & Tablet Card Layout */}
+                  <div className="divide-y divide-[#edf0eb] lg:hidden">
+                    {visibleCustomers.map((customer) => {
+                      const hasDue =
+                        customer.pending_balance !== null &&
+                        customer.pending_balance > 0;
+                      const isSettled =
+                        customer.total_billed !== null &&
+                        customer.total_billed > 0 &&
+                        customer.pending_balance === 0;
+
+                      return (
+                        <div key={customer.id} className="p-4 sm:p-5">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-3">
+                              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#edf3ec] text-sm font-semibold text-[#52755a]">
+                                {customer.name.trim().charAt(0).toUpperCase()}
+                              </span>
+                              <div>
+                                <h4 className="text-sm font-semibold text-[#25372c]">
+                                  {customer.name}
+                                </h4>
+                                <div className="mt-1 space-y-0.5 text-xs text-[#6e7b71]">
+                                  {customer.phone && (
+                                    <p className="flex items-center gap-1">
+                                      <Phone size={11} className="text-[#96a198]" />
+                                      {customer.phone}
+                                    </p>
+                                  )}
+                                  {customer.address && (
+                                    <p className="flex items-center gap-1">
+                                      <MapPin size={11} className="text-[#96a198]" />
+                                      {customer.address}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                            <div>
+                              {hasDue ? (
+                                <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700">
+                                  Due
+                                </span>
+                              ) : isSettled ? (
+                                <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-800">
+                                  Paid
+                                </span>
+                              ) : (
+                                <span className="rounded-full bg-[#edf0eb] px-2 py-0.5 text-[10px] font-medium text-[#717d74]">
+                                  No Sales
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Metrics grid for mobile */}
+                          <div className="mt-3.5 grid grid-cols-3 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-center text-xs">
+                            <div>
+                              <span className="block text-[10px] text-[#818d83]">Billed</span>
+                              <span className="mt-0.5 block font-semibold text-[#324036]">
+                                {formatOptionalMoney(customer.total_billed)}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="block text-[10px] text-[#818d83]">Paid</span>
+                              <span className="mt-0.5 block font-semibold text-[#285d42]">
+                                {formatOptionalMoney(customer.total_paid)}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="block text-[10px] text-[#818d83]">Balance</span>
+                              <span
+                                className={`mt-0.5 block font-bold ${
+                                  hasDue
+                                    ? "text-red-600"
+                                    : "text-emerald-700"
+                                }`}
+                              >
+                                {formatOptionalMoney(customer.pending_balance)}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Mobile Actions Bar */}
+                          <div className="mt-3 flex flex-wrap items-center justify-between gap-1.5 border-t border-[#f2f4ef] pt-3">
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                className="flex items-center gap-1 rounded-lg border border-[#e2e7e0] bg-white px-2.5 py-1.5 text-xs font-semibold text-[#445248]"
+                                onClick={() => openModal("customer-details", customer)}
+                              >
+                                <Eye size={13} /> Details
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-lg p-1.5 text-[#6c7870] hover:bg-[#edf2eb]"
+                                onClick={() => openModal("edit-customer", customer)}
+                                title="Edit profile"
+                              >
+                                <Edit size={14} />
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                className="rounded-lg bg-[#edf4ed] px-2.5 py-1.5 text-xs font-semibold text-[#285d42] disabled:opacity-40"
+                                disabled={
+                                  customer.pending_balance == null ||
+                                  customer.pending_balance <= 0
+                                }
+                                onClick={() => openModal("payment", customer)}
+                              >
+                                Receive
+                              </button>
+                              <button
+                                type="button"
+                                className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e]"
+                                onClick={() => openModal("ledger", customer)}
+                              >
+                                <BookOpen size={13} /> Ledger
+                              </button>
+                              <WhatsAppReminder customer={customer} />
+                            </div>
+                          </div>
                         </div>
-                      </td>
-                      <td className="px-4 py-4">
-                        <span className="block text-sm text-[#59685d]">
-                          {customer.phone || "No phone"}
-                        </span>
-                        <span className="mt-1 block max-w-[200px] truncate text-xs text-[#929a93]">
-                          {customer.address || "Area not provided"}
-                        </span>
-                      </td>
-                      <td className="px-4 py-4 text-right text-sm text-[#59685d]">
-                        {formatOptionalMoney(customer.total_billed)}
-                      </td>
-                      <td className="px-4 py-4 text-right text-sm text-[#59685d]">
-                        {formatOptionalMoney(customer.total_paid)}
-                      </td>
-                      <td
-                        className={`px-4 py-4 text-right text-sm font-bold ${
-                          customer.pending_balance != null &&
-                          customer.pending_balance > 0
-                            ? "text-red-600"
-                            : customer.pending_balance == null
-                              ? "text-[#8b938d]"
-                              : "text-emerald-700"
-                        }`}
-                      >
-                        {formatOptionalMoney(customer.pending_balance)}
-                      </td>
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            className="rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e] hover:bg-[#eef4ee]"
-                            disabled={
-                              customer.pending_balance == null ||
-                              customer.pending_balance <= 0
-                            }
-                            onClick={() => openModal("payment", customer)}
-                          >
-                            Receive
-                          </button>
-                          <button
-                            type="button"
-                            className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e] hover:bg-[#eef4ee]"
-                            onClick={() => openModal("ledger", customer)}
-                          >
-                            <BookOpen size={14} /> Ledger
-                          </button>
-                          <WhatsAppReminder customer={customer} />
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                    </tbody>
-                  </table>
-                </div>
+                      );
+                    })}
+                  </div>
+                </>
               )}
               <div className="flex items-center justify-between border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-xs text-[#8d968e]">
                 <span>
@@ -873,20 +1250,50 @@ export default function Home() {
               </div>
             </div>
           </section>
+        )}
 
-          {dashboardData?.salesAvailable && !dataStale && (
-            <section className="mt-9 grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,0.8fr)]">
-              <SalesTrend
-                businessDate={businessDate}
-                dailyTotals={dashboardData.dailyTotals}
-                available={dashboardData.salesComplete}
-              />
-              <RecentSales
-                sales={dashboardData.recentSales}
-                customers={customers}
-                complete={dashboardData.salesComplete}
-              />
-            </section>
+          {activeTab === "sales" && (
+            <div className="mt-8 space-y-6">
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[#e8ece5] bg-white p-5 shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
+                <div>
+                  <h3 className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]">
+                    Sales Management
+                  </h3>
+                  <p className="mt-1 text-xs text-[#838c85]">
+                    Daily packet sales, 14-day trends, and chronological transaction records.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className={primaryButton}
+                  onClick={() => openModal("sale")}
+                >
+                  <Plus size={16} />
+                  New Sale Entry
+                </button>
+              </div>
+
+              {dashboardData?.salesAvailable && !dataStale ? (
+                <section className="grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,0.8fr)]">
+                  <SalesTrend
+                    businessDate={businessDate}
+                    dailyTotals={dashboardData.dailyTotals}
+                    available={dashboardData.salesComplete}
+                  />
+                  <RecentSales
+                    sales={dashboardData.recentSales}
+                    customers={customers}
+                    complete={dashboardData.salesComplete}
+                  />
+                </section>
+              ) : (
+                <div className="rounded-2xl border border-dashed border-[#e2e6df] bg-white p-8 text-center text-sm text-[#7b847e]">
+                  {dataLoading
+                    ? "Loading sales data…"
+                    : "No sales recorded yet. Click 'New Sale Entry' to log today's sales."}
+                </div>
+              )}
+            </div>
           )}
 
           <footer className="mt-8 flex flex-col gap-2 border-t border-[#e7eae4] pt-5 text-xs text-[#929a93] sm:flex-row sm:items-center sm:justify-between">
@@ -900,7 +1307,11 @@ export default function Home() {
       </main>
 
       {modal && (
-        <Modal title={modalTitle(modal)} onClose={closeModal}>
+        <Modal
+          title={modalTitle(modal)}
+          onClose={closeModal}
+          maxWidth={modal === "customer-details" ? "max-w-2xl" : "max-w-lg"}
+        >
           {modal === "customer" && (
             <form onSubmit={handleNewCustomer} className="space-y-4">
               <Field label="Customer name" required>
@@ -944,6 +1355,62 @@ export default function Home() {
             </form>
           )}
 
+          {modal === "edit-customer" && selectedCustomer && (
+            <form onSubmit={handleEditCustomer} className="space-y-4">
+              <Field label="Customer name" required>
+                <input
+                  className={inputClass}
+                  name="name"
+                  defaultValue={selectedCustomer.name}
+                  autoFocus
+                  required
+                  maxLength={120}
+                  placeholder="e.g. Lakshmi Stores"
+                />
+              </Field>
+              <Field label="Phone number">
+                <input
+                  className={inputClass}
+                  name="phone"
+                  defaultValue={selectedCustomer.phone ?? ""}
+                  type="tel"
+                  inputMode="numeric"
+                  pattern="[0-9]{10}"
+                  minLength={10}
+                  maxLength={10}
+                  title="Enter a 10-digit phone number."
+                  placeholder="9876543210 (optional)"
+                />
+              </Field>
+              <Field label="Address">
+                <input
+                  className={inputClass}
+                  name="address"
+                  defaultValue={selectedCustomer.address ?? ""}
+                  maxLength={240}
+                  placeholder="Area, town, or village (optional)"
+                />
+              </Field>
+              <FormError message={formError} />
+              <ModalActions
+                onCancel={closeModal}
+                saving={saving}
+                submitLabel="Save changes"
+              />
+            </form>
+          )}
+
+          {modal === "customer-details" && selectedCustomer && (
+            <CustomerDetailsView
+              customer={selectedCustomer}
+              entries={ledger}
+              loading={ledgerLoading}
+              error={formError}
+              onReceivePayment={() => openModal("payment", selectedCustomer)}
+              onEditCustomer={() => openModal("edit-customer", selectedCustomer)}
+            />
+          )}
+
           {modal === "sale" && (
             <SaleForm
               customers={customers}
@@ -976,6 +1443,252 @@ export default function Home() {
           )}
         </Modal>
       )}
+    </div>
+  );
+}
+
+function CustomerDetailsView({
+  customer,
+  entries,
+  loading,
+  error,
+  onReceivePayment,
+  onEditCustomer,
+}: {
+  customer: Customer;
+  entries: LedgerEntry[];
+  loading: boolean;
+  error: string;
+  onReceivePayment: () => void;
+  onEditCustomer: () => void;
+}) {
+  const phoneDigits = (customer.phone ?? "").replace(/\D/g, "");
+  const whatsappPhone =
+    phoneDigits.length === 10
+      ? `91${phoneDigits}`
+      : phoneDigits.startsWith("0") && phoneDigits.length === 11
+        ? `91${phoneDigits.slice(1)}`
+        : phoneDigits;
+  const whatsappMessage = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatOptionalMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
+  const whatsappHref =
+    whatsappPhone && customer.pending_balance !== null
+      ? `https://wa.me/${whatsappPhone}?text=${encodeURIComponent(whatsappMessage)}`
+      : null;
+
+  const salesEntries = entries.filter((e) => e.kind === "sale");
+  const paymentEntries = entries.filter((e) => e.kind === "payment");
+
+  return (
+    <div className="space-y-5">
+      {/* Profile Header */}
+      <div className="rounded-2xl border border-[#e8ece5] bg-[#f8faf7] p-4 sm:p-5">
+        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
+          <div className="flex items-start gap-3">
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#285d42] text-lg font-bold text-white shadow-sm">
+              {customer.name.trim().charAt(0).toUpperCase()}
+            </span>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-base font-semibold text-[#25372c]">
+                  {customer.name}
+                </h3>
+                {customer.pending_balance !== null && customer.pending_balance > 0 ? (
+                  <span className="rounded-md bg-red-100 px-2 py-0.5 text-[11px] font-semibold text-red-700">
+                    Due Pending
+                  </span>
+                ) : customer.total_billed !== null && customer.total_billed > 0 && customer.pending_balance === 0 ? (
+                  <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
+                    Fully Paid
+                  </span>
+                ) : (
+                  <span className="rounded-md bg-[#edf0eb] px-2 py-0.5 text-[11px] font-medium text-[#647167]">
+                    No Sales
+                  </span>
+                )}
+              </div>
+              <div className="mt-2 space-y-1 text-xs text-[#606d63]">
+                {customer.phone ? (
+                  <p className="flex items-center gap-1.5 font-medium">
+                    <Phone size={13} className="text-[#89978c]" />
+                    {customer.phone}
+                  </p>
+                ) : (
+                  <p className="flex items-center gap-1.5 italic text-[#9aa49d]">
+                    <Phone size={13} className="text-[#aab3ac]" />
+                    No phone number added
+                  </p>
+                )}
+                {customer.address ? (
+                  <p className="flex items-center gap-1.5">
+                    <MapPin size={13} className="text-[#89978c]" />
+                    {customer.address}
+                  </p>
+                ) : (
+                  <p className="flex items-center gap-1.5 italic text-[#9aa49d]">
+                    <MapPin size={13} className="text-[#aab3ac]" />
+                    No address provided
+                  </p>
+                )}
+                <p className="flex items-center gap-1.5 text-[11px] text-[#8e9891]">
+                  <Calendar size={13} className="text-[#a0aaa2]" />
+                  Joined on {formatDate(customer.created_at)}
+                </p>
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onEditCustomer}
+            className={`${secondaryButton} !h-8 !px-3 text-xs`}
+          >
+            <Edit size={13} />
+            Edit Profile
+          </button>
+        </div>
+
+        {/* Khata Financial Summary */}
+        <div className="mt-4 grid grid-cols-3 gap-2 border-t border-[#e2e7e0] pt-3 text-center sm:gap-3">
+          <div className="rounded-xl bg-white p-2.5 shadow-sm">
+            <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#79857c]">
+              Total Billed
+            </span>
+            <span className="mt-1 block text-sm font-semibold text-[#25372c]">
+              {formatOptionalMoney(customer.total_billed)}
+            </span>
+          </div>
+          <div className="rounded-xl bg-white p-2.5 shadow-sm">
+            <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#79857c]">
+              Total Paid
+            </span>
+            <span className="mt-1 block text-sm font-semibold text-[#285d42]">
+              {formatOptionalMoney(customer.total_paid)}
+            </span>
+          </div>
+          <div className="rounded-xl bg-white p-2.5 shadow-sm">
+            <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#79857c]">
+              Outstanding Due
+            </span>
+            <span
+              className={`mt-1 block text-sm font-bold ${
+                customer.pending_balance !== null && customer.pending_balance > 0
+                  ? "text-red-600"
+                  : "text-emerald-700"
+              }`}
+            >
+              {formatOptionalMoney(customer.pending_balance)}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Action shortcuts */}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          className={primaryButton}
+          disabled={
+            customer.pending_balance === null || customer.pending_balance <= 0
+          }
+          onClick={onReceivePayment}
+        >
+          <Banknote size={16} />
+          Receive Due Payment
+        </button>
+        {whatsappHref ? (
+          <a
+            className={`${secondaryButton} text-[#28734b]`}
+            href={whatsappHref}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <MessageCircle size={16} />
+            WhatsApp Reminder
+          </a>
+        ) : (
+          <button
+            type="button"
+            className={secondaryButton}
+            disabled
+            title="A 10-digit phone number is required to send a WhatsApp reminder."
+          >
+            <MessageCircle size={16} />
+            WhatsApp Unavailable
+          </button>
+        )}
+      </div>
+
+      <FormError message={error} />
+
+      {/* Transaction History Tabs / Preview */}
+      <div>
+        <div className="mb-2.5 flex items-center justify-between">
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-[#68766c]">
+            Transaction History ({entries.length})
+          </h4>
+          <span className="text-[11px] text-[#8e9891]">
+            {salesEntries.length} sales · {paymentEntries.length} payments
+          </span>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-[#e0e5dd] py-10 text-sm text-[#7c867e]">
+            <LoaderCircle size={17} className="animate-spin" />
+            Loading transaction history…
+          </div>
+        ) : entries.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-[#dfe5dc] py-8 text-center">
+            <ShoppingBag className="mx-auto text-[#8ca18d]" size={22} />
+            <p className="mt-2 text-sm font-semibold text-[#405046]">No transactions recorded</p>
+            <p className="mt-1 text-xs text-[#8a938c]">
+              Sales and payments recorded for this customer will appear here.
+            </p>
+          </div>
+        ) : (
+          <div className="max-h-[300px] overflow-y-auto rounded-xl border border-[#e8ece5] bg-white">
+            <table className="w-full text-left text-xs">
+              <thead className="sticky top-0 border-b border-[#eef0eb] bg-[#fbfcfa] text-[10px] font-semibold uppercase tracking-[0.1em] text-[#919a92]">
+                <tr>
+                  <th className="px-3.5 py-2.5">Date</th>
+                  <th className="px-3 py-2.5">Type &amp; Description</th>
+                  <th className="px-3 py-2.5 text-right">Debit</th>
+                  <th className="px-3 py-2.5 text-right">Credit</th>
+                  <th className="px-3.5 py-2.5 text-right">Balance</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#eef0eb]">
+                {entries.map((entry) => (
+                  <tr key={`${entry.kind}-${entry.id}`} className="hover:bg-[#fafbf9]">
+                    <td className="whitespace-nowrap px-3.5 py-2.5 font-medium text-[#657368]">
+                      {formatDate(entry.date)}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <span className="font-semibold text-[#2f3f33]">
+                        {entry.description}
+                      </span>
+                      {entry.kind === "sale" && (
+                        <span className="block text-[10px] text-[#88948a]">
+                          {entry.sale_unit === "bulk"
+                            ? `${entry.sale_quantity} kg @ ${formatMoney(entry.rate_per_unit)}`
+                            : `${entry.sale_quantity} × ${entry.sale_unit} @ ${formatMoney(entry.rate_per_unit)}`}
+                        </span>
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2.5 text-right text-[#4d5c50]">
+                      {entry.debit ? formatMoney(entry.debit) : "—"}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2.5 text-right text-[#285d42]">
+                      {entry.credit ? formatMoney(entry.credit) : "—"}
+                    </td>
+                    <td className="whitespace-nowrap px-3.5 py-2.5 text-right font-semibold text-[#48564c]">
+                      {formatMoney(entry.balance)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1301,10 +2014,12 @@ function Modal({
   title,
   onClose,
   children,
+  maxWidth = "max-w-[520px]",
 }: {
   title: string;
   onClose: () => void;
   children: React.ReactNode;
+  maxWidth?: string;
 }) {
   return (
     <div
@@ -1317,7 +2032,7 @@ function Modal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="modal-title"
-        className="soft-scrollbar max-h-[92vh] w-full max-w-[520px] overflow-y-auto rounded-t-[24px] bg-white p-5 shadow-[0_25px_80px_rgba(17,35,23,0.2)] sm:rounded-[24px] sm:p-7"
+        className={`soft-scrollbar max-h-[92vh] w-full ${maxWidth} overflow-y-auto rounded-t-[24px] bg-white p-5 shadow-[0_25px_80px_rgba(17,35,23,0.2)] sm:rounded-[24px] sm:p-7`}
       >
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
@@ -1350,6 +2065,10 @@ function modalTitle(modal: Exclude<ModalKind, null>) {
   switch (modal) {
     case "customer":
       return "Add a customer";
+    case "edit-customer":
+      return "Edit customer profile";
+    case "customer-details":
+      return "Customer Details & Khata";
     case "sale":
       return "Record a daily sale";
     case "payment":
