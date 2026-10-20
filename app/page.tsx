@@ -117,7 +117,7 @@ export default function Home() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
-  const [mobileMenu, setMobileMenu] = useState(false);
+  const [mobileMenu, setMobileMenu] = useState(false); // eslint-disable-line no-unused-vars
 
   useEffect(() => {
     let supabase: ReturnType<typeof getSupabaseClient>;
@@ -482,6 +482,14 @@ export default function Home() {
           >
             <Users size={18} strokeWidth={1.8} />
             Customers
+          </a>
+          <a
+            href="#sales"
+            onClick={() => setMobileMenu(false)}
+            className="mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-[#717b74] transition hover:bg-[#f7f8f5] hover:text-[#25372c] bg-[#eef4ee]"
+          >
+            <ShoppingBag size={18} strokeWidth={1.8} />
+            Sales
           </a>
         </div>
 
