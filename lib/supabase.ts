@@ -18,6 +18,7 @@ export type RecentSale = {
   sale_date: string;
   total_amount: number;
   amount_paid: number;
+  overpaid_amount: number;
   balance: number;
   sale_unit: "500g" | "1kg" | "bulk";
   sale_quantity: number;
@@ -139,6 +140,7 @@ type SalesSummaryRow = Pick<
   | "sale_date"
   | "total_amount"
   | "amount_paid"
+  | "overpaid_amount"
   | "balance"
   | "sale_unit"
   | "sale_quantity"
@@ -283,7 +285,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       await supabase
         .from("sales")
         .select(
-          "id, customer_id, sale_date, total_amount, amount_paid, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
+          "id, customer_id, sale_date, total_amount, amount_paid, overpaid_amount, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
           { count: from === 0 ? "exact" : undefined },
         )
         .order("sale_date", { ascending: false })
@@ -327,7 +329,9 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     for (const sale of sales) {
       if (sale.status !== "completed") continue;
       const billedCents = toCents(Number(sale.total_amount));
-      const salePaidCents = toCents(Number(sale.amount_paid));
+      const salePaidCents = toCents(
+        Number(sale.amount_paid) + Number(sale.overpaid_amount),
+      );
       const totals = totalsByCustomer.get(sale.customer_id) ?? {
         billedCents: 0,
         paidCents: 0,
@@ -373,7 +377,9 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     : null;
   const allTimePaidCents = canCalculateCollected
     ? completedSales.reduce(
-        (sum, sale) => sum + toCents(Number(sale.amount_paid)),
+        (sum, sale) =>
+          sum +
+          toCents(Number(sale.amount_paid) + Number(sale.overpaid_amount)),
         0,
       ) +
       payments.reduce((sum, payment) => sum + toCents(Number(payment.amount)), 0)
@@ -580,11 +586,6 @@ export async function addDailySale(input: {
   if (!Number.isFinite(discount) || discount < 0 || discount > gross) {
     throw new Error("Discount must be between zero and the bill total.");
   }
-  const total = Math.round((gross - discount) * 100) / 100;
-  if ((input.amountPaid ?? 0) > total) {
-    throw new Error("Amount paid cannot be more than the sale total.");
-  }
-
   const { data, error } = await getSupabaseClient().rpc("add_sale", {
     p_customer_id: input.customerId,
     p_sale_unit: input.saleUnit,
@@ -636,9 +637,8 @@ export async function updateSale(input: {
   if (!Number.isFinite(discount) || discount < 0 || discount > gross) {
     throw new Error("Discount must be between zero and the bill total.");
   }
-  const total = Math.round((gross - discount) * 100) / 100;
-  if ((input.amountPaid ?? 0) < 0 || (input.amountPaid ?? 0) > total) {
-    throw new Error("Amount paid must be between zero and the sale total.");
+  if (!Number.isFinite(input.amountPaid ?? 0) || (input.amountPaid ?? 0) < 0) {
+    throw new Error("Amount paid cannot be negative.");
   }
 
   const { data, error } = await getSupabaseClient().rpc("update_sale", {
@@ -676,7 +676,7 @@ export async function fetchSalesHistory(): Promise<SaleRecord[]> {
     await supabase
       .from("sales")
       .select(
-        "id, customer_id, sale_date, total_amount, amount_paid, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
+        "id, customer_id, sale_date, total_amount, amount_paid, overpaid_amount, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
         { count: from === 0 ? "exact" : undefined },
       )
       .order("sale_date", { ascending: false })

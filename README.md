@@ -15,7 +15,7 @@ All ledger tables use row-level security and require an authenticated Supabase u
 ## Ledger rules
 
 - Sale totals are calculated and rounded to two decimal places in the database from kilograms × price per kilogram.
-- A sale's initial payment cannot exceed its total; the remaining amount is recorded as its balance.
+- Sale-time payments may exceed the amount due. The excess is saved as customer advance and automatically applied to that customer's next sale.
 - A standalone payment reduces the customer's aggregate outstanding balance and cannot exceed the current due.
 - Customer pending balances are computed as total sale amounts minus sale-time payments and standalone payments.
 - Daily summary cards use the selected local calendar date for sale totals and cash collected. The quick-sale form supports 500 g packets, 1 kg packets, and bulk sales priced per kilogram.

@@ -198,6 +198,20 @@ export default function Home() {
       setCustomers(result.customers);
       setDashboardData(result);
       setDataError(result.warning ?? "");
+      // Keep any open customer profile or details modal in sync with the
+      // freshly calculated billed / paid / pending balances.
+      setViewingCustomer((current) =>
+        current
+          ? (result.customers.find((customer) => customer.id === current.id) ??
+            current)
+          : current,
+      );
+      setSelectedCustomer((current) =>
+        current
+          ? (result.customers.find((customer) => customer.id === current.id) ??
+            current)
+          : current,
+      );
       return !result.warning;
     } catch (error) {
       setDataStale(true);
@@ -255,6 +269,20 @@ export default function Home() {
   useEffect(() => {
     if (authenticated && activeTab === "sales") void refreshSalesHistory();
   }, [authenticated, activeTab, refreshSalesHistory]);
+
+  async function refreshSaleData() {
+    const customersRefreshed = await refreshCustomers();
+    await refreshSalesHistory();
+    if (stock || activeTab === "stock" || activeTab === "overview") {
+      await refreshStock();
+    }
+    if (viewingCustomer) {
+      void fetchCustomerLedger(viewingCustomer.id)
+        .then(setLedger)
+        .catch(() => {});
+    }
+    return customersRefreshed;
+  }
 
   const visibleCustomers = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -528,14 +556,7 @@ export default function Home() {
         saleDate: String(form.get("saleDate") ?? today()),
         notes: String(form.get("notes") ?? ""),
       });
-      const customersRefreshed = await refreshCustomers();
-      if (activeTab === "sales") void refreshSalesHistory();
-      if (viewingCustomer) {
-        void fetchCustomerLedger(viewingCustomer.id)
-          .then(setLedger)
-          .catch(() => {});
-      }
-      if (activeTab === "stock" || stock) void refreshStock();
+      const customersRefreshed = await refreshSaleData();
       setModal(null);
       setSuccessMessage(
         customersRefreshed
@@ -572,14 +593,7 @@ export default function Home() {
         saleDate: String(form.get("saleDate") ?? selectedSale.sale_date),
         notes: String(form.get("notes") ?? ""),
       });
-      const customersRefreshed = await refreshCustomers();
-      await refreshSalesHistory();
-      if (stock) void refreshStock();
-      if (viewingCustomer) {
-        void fetchCustomerLedger(viewingCustomer.id)
-          .then(setLedger)
-          .catch(() => {});
-      }
+      const customersRefreshed = await refreshSaleData();
       setModal(null);
       setSelectedSale(null);
       setSuccessMessage(
@@ -602,14 +616,7 @@ export default function Home() {
     const form = new FormData(event.currentTarget);
     try {
       await cancelSale(selectedSale.id, String(form.get("reason") ?? ""));
-      const customersRefreshed = await refreshCustomers();
-      await refreshSalesHistory();
-      if (stock) void refreshStock();
-      if (viewingCustomer) {
-        void fetchCustomerLedger(viewingCustomer.id)
-          .then(setLedger)
-          .catch(() => {});
-      }
+      const customersRefreshed = await refreshSaleData();
       setModal(null);
       setSelectedSale(null);
       setSuccessMessage(
@@ -902,11 +909,11 @@ export default function Home() {
             <div className="flex flex-wrap items-center justify-end gap-2">
               <button
                 type="button"
-                aria-label="Refresh dashboard"
-                title="Refresh customer data"
+                aria-label="Refresh all data"
+                title="Refresh customers, sales, and stock"
                 className={`${secondaryButton} !w-10 !px-0`}
-                disabled={dataLoading}
-                onClick={() => void refreshCustomers()}
+                disabled={dataLoading || salesHistoryLoading || stockLoading}
+                onClick={() => void refreshSaleData()}
               >
                 <RefreshCw
                   size={16}
@@ -3684,7 +3691,8 @@ function SalesManagement({
     0,
   );
   const collected = completed.reduce(
-    (sum, sale) => sum + Number(sale.amount_paid),
+    (sum, sale) =>
+      sum + Number(sale.amount_paid) + Number(sale.overpaid_amount),
     0,
   );
   const outstanding = completed.reduce(
@@ -3697,10 +3705,18 @@ function SalesManagement({
   );
   const cashCollected = completed
     .filter((sale) => sale.payment_method === "cash")
-    .reduce((sum, sale) => sum + Number(sale.amount_paid), 0);
+    .reduce(
+      (sum, sale) =>
+        sum + Number(sale.amount_paid) + Number(sale.overpaid_amount),
+      0,
+    );
   const upiCollected = completed
     .filter((sale) => sale.payment_method === "upi")
-    .reduce((sum, sale) => sum + Number(sale.amount_paid), 0);
+    .reduce(
+      (sum, sale) =>
+        sum + Number(sale.amount_paid) + Number(sale.overpaid_amount),
+      0,
+    );
   const cancelledCount = filtered.filter(
     (sale) => sale.status === "cancelled",
   ).length;
@@ -3872,7 +3888,7 @@ function SalesManagement({
       ) : (
         <>
           <div className="hidden overflow-x-auto lg:block">
-            <table className="w-full min-w-[1080px] text-left">
+            <table className="w-full min-w-[1160px] text-left">
               <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
                 <tr className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#969e97]">
                   <th className="px-5 py-3">Date</th>
@@ -3881,6 +3897,7 @@ function SalesManagement({
                   <th className="px-4 py-3">Payment</th>
                   <th className="px-4 py-3 text-right">Billed</th>
                   <th className="px-4 py-3 text-right">Paid</th>
+                  <th className="px-4 py-3 text-right">Extra paid</th>
                   <th className="px-4 py-3 text-right">Balance at sale</th>
                   <th className="px-4 py-3 text-center">Status</th>
                   <th className="px-5 py-3 text-right">Actions</th>
@@ -3891,7 +3908,9 @@ function SalesManagement({
                   const customer = customerMap.get(sale.customer_id);
                   const status = saleStatusBadge(sale);
                   const total = Number(sale.total_amount);
-                  const paid = Number(sale.amount_paid);
+                  const paid =
+                    Number(sale.amount_paid) + Number(sale.overpaid_amount);
+                  const overpaid = Number(sale.overpaid_amount);
                   const balance = Number(sale.balance);
                   const isCancelled = sale.status === "cancelled";
 
@@ -3968,6 +3987,9 @@ function SalesManagement({
                       <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-medium text-[#285d42]">
                         {formatMoney(paid)}
                       </td>
+                      <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-medium text-[#285d42]">
+                        {overpaid > 0 ? formatMoney(overpaid) : "—"}
+                      </td>
                       <td
                         className={`whitespace-nowrap px-4 py-3.5 text-right text-sm font-bold ${
                           isCancelled
@@ -4033,7 +4055,9 @@ function SalesManagement({
               const customer = customerMap.get(sale.customer_id);
               const status = saleStatusBadge(sale);
               const total = Number(sale.total_amount);
-              const paid = Number(sale.amount_paid);
+              const paid =
+                Number(sale.amount_paid) + Number(sale.overpaid_amount);
+              const overpaid = Number(sale.overpaid_amount);
               const balance = Number(sale.balance);
               const isCancelled = sale.status === "cancelled";
 
@@ -4105,7 +4129,7 @@ function SalesManagement({
                     )}
                   </div>
 
-                  <div className="mt-3 grid grid-cols-3 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-center text-xs">
+                  <div className="mt-3 grid grid-cols-2 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-center text-xs">
                     <div>
                       <span className="block text-[10px] text-[#818d83]">
                         Billed
@@ -4126,6 +4150,14 @@ function SalesManagement({
                       </span>
                       <span className="mt-0.5 block font-semibold text-[#285d42]">
                         {formatMoney(paid)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="block text-[10px] text-[#818d83]">
+                        Extra paid
+                      </span>
+                      <span className="mt-0.5 block font-semibold text-[#285d42]">
+                        {overpaid > 0 ? formatMoney(overpaid) : "—"}
                       </span>
                     </div>
                     <div>
@@ -4210,7 +4242,8 @@ function ReceiptView({
   const total = Number(sale.total_amount);
   const discount = Number(sale.discount_amount);
   const gross = total + discount;
-  const paid = Number(sale.amount_paid);
+  const overpaid = Number(sale.overpaid_amount);
+  const paid = Number(sale.amount_paid) + overpaid;
   const balance = Number(sale.balance);
 
   return (
@@ -4277,6 +4310,14 @@ function ReceiptView({
             {formatMoney(paid)}
           </span>
         </div>
+        {overpaid > 0 && (
+          <div className="flex justify-between gap-4">
+            <span className="text-[#7d877f]">Extra paid · advance</span>
+            <span className="font-semibold text-[#285d42]">
+              {formatMoney(overpaid)}
+            </span>
+          </div>
+        )}
         <div className="flex justify-between gap-4 font-bold">
           <span>Balance</span>
           <span className={balance > 0 ? "text-red-600" : "text-emerald-700"}>
@@ -4346,7 +4387,8 @@ function printReceipt(sale: SaleRecord, customer: Customer | undefined) {
   const total = Number(sale.total_amount);
   const discount = Number(sale.discount_amount);
   const gross = total + discount;
-  const paid = Number(sale.amount_paid);
+  const overpaid = Number(sale.overpaid_amount);
+  const paid = Number(sale.amount_paid) + overpaid;
   const balance = Number(sale.balance);
   const receiptNumber = sale.id.slice(0, 8).toUpperCase();
   const windowRef = window.open("", "_blank", "width=420,height=640");
@@ -4395,6 +4437,7 @@ function printReceipt(sale: SaleRecord, customer: Customer | undefined) {
     <div class="divider"></div>
     <div class="row total"><span>Total</span><span>${escapeHtml(formatMoney(total))}</span></div>
     <div class="row"><span class="muted">Paid</span><span class="strong">${escapeHtml(formatMoney(paid))}</span></div>
+    ${overpaid > 0 ? `<div class="row"><span class="muted">Extra paid · advance</span><span class="strong">${escapeHtml(formatMoney(overpaid))}</span></div>` : ""}
     <div class="row strong"><span>Balance</span><span>${escapeHtml(formatMoney(balance))}</span></div>
     <div class="row"><span class="muted">Payment</span><span class="strong">${escapeHtml(paymentMethodLabel(sale.payment_method))}</span></div>
     ${sale.status === "cancelled" ? `<div class="cancelled">CANCELLED</div>` : ""}
@@ -4619,7 +4662,9 @@ function SaleForm({
     sale ? String(Number(sale.rate_per_unit)) : "",
   );
   const [paid, setPaid] = useState(
-    sale ? String(Number(sale.amount_paid)) : "",
+    sale
+      ? String(Number(sale.amount_paid) + Number(sale.overpaid_amount))
+      : "",
   );
   const [discount, setDiscount] = useState(
     sale ? String(Number(sale.discount_amount)) : "",
@@ -4632,6 +4677,7 @@ function SaleForm({
   const discountValue = Math.max(0, Number(discount || 0));
   const total = Math.max(0, Math.round((gross - discountValue) * 100) / 100);
   const balance = Math.max(0, total - Number(paid || 0));
+  const overpaid = Math.max(0, Number(paid || 0) - total);
   const isNewCustomer = !isEditing && customerId === "__new_customer__";
   const selectedCustomer = customers.find(
     (customer) => customer.id === customerId,
@@ -4784,7 +4830,6 @@ function SaleForm({
             type="number"
             name="amountPaid"
             min="0"
-            max={total.toFixed(2)}
             step="0.01"
             value={paid}
             onChange={(event) => setPaid(event.target.value)}
@@ -4870,13 +4915,21 @@ function SaleForm({
             {formatMoney(Number(paid || 0))}
           </span>
         </div>
+        {overpaid > 0 && (
+          <div className="mt-2 flex items-center justify-between text-[#285d42]">
+            <span>Extra paid · customer advance</span>
+            <span className="font-semibold">{formatMoney(overpaid)}</span>
+          </div>
+        )}
         <div className="mt-2 flex items-center justify-between border-t border-[#e7ede5] pt-2">
           <span className="text-[#6c796f]">
             {Number(paid || 0) <= 0
               ? "Full amount added to balance"
               : balance > 0
                 ? "Remaining added to balance"
-                : "Fully paid"}
+                : overpaid > 0
+                  ? "Extra kept as customer advance"
+                  : "Fully paid"}
           </span>
           <span className="font-semibold text-[#9a6133]">
             {formatMoney(balance)}

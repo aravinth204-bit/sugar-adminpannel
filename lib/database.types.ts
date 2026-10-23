@@ -42,6 +42,8 @@ export type Database = {
           unit_price: number;
           total_amount: number;
           amount_paid: number;
+          overpaid_amount: number;
+          credit_applied: number;
           balance: number;
           notes: string | null;
           sale_unit: "500g" | "1kg" | "bulk";
@@ -62,6 +64,8 @@ export type Database = {
           unit_price: number;
           total_amount: number;
           amount_paid: number;
+          overpaid_amount?: number;
+          credit_applied?: number;
           balance: number;
           notes?: string | null;
           sale_unit?: "500g" | "1kg" | "bulk";
@@ -82,6 +86,8 @@ export type Database = {
           unit_price?: number;
           total_amount?: number;
           amount_paid?: number;
+          overpaid_amount?: number;
+          credit_applied?: number;
           balance?: number;
           notes?: string | null;
           sale_unit?: "500g" | "1kg" | "bulk";
