@@ -23,6 +23,22 @@ export type RecentSale = {
   sale_quantity: number;
   rate_per_unit: number;
   notes: string | null;
+  discount_amount: number;
+  payment_method: "cash" | "upi";
+  status: "completed" | "cancelled";
+  cancelled_at: string | null;
+  cancel_reason: string | null;
+  created_at: string;
+};
+
+export type SaleRecord = RecentSale;
+
+export type RecentPayment = {
+  id: string;
+  customer_id: string;
+  payment_date: string;
+  amount: number;
+  notes: string | null;
   created_at: string;
 };
 
@@ -34,6 +50,7 @@ export type CustomerSummaryResult = {
   outstanding: number | null;
   dailyTotals: Record<string, DailyTotals>;
   recentSales: RecentSale[];
+  recentPayments: RecentPayment[];
   salesAvailable: boolean;
   salesComplete: boolean;
   paymentsAvailable: boolean;
@@ -106,6 +123,7 @@ type StockSaleRow = {
   sale_unit: StockUnit;
   sale_quantity: number;
   sale_date: string;
+  status: "completed" | "cancelled";
   created_at: string;
 };
 
@@ -126,11 +144,16 @@ type SalesSummaryRow = Pick<
   | "sale_quantity"
   | "rate_per_unit"
   | "notes"
+  | "discount_amount"
+  | "payment_method"
+  | "status"
+  | "cancelled_at"
+  | "cancel_reason"
   | "created_at"
 >;
 type PaymentSummaryRow = Pick<
   Database["public"]["Tables"]["payments"]["Row"],
-  "customer_id" | "payment_date" | "amount" | "id"
+  "customer_id" | "payment_date" | "amount" | "id" | "notes" | "created_at"
 >;
 
 const QUERY_PAGE_SIZE = 500;
@@ -260,7 +283,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       await supabase
         .from("sales")
         .select(
-          "id, customer_id, sale_date, total_amount, amount_paid, balance, sale_unit, sale_quantity, rate_per_unit, notes, created_at",
+          "id, customer_id, sale_date, total_amount, amount_paid, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
           { count: from === 0 ? "exact" : undefined },
         )
         .order("sale_date", { ascending: false })
@@ -270,7 +293,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     fetchAllPages<PaymentSummaryRow>(async (from, to) =>
       await supabase
         .from("payments")
-        .select("customer_id, payment_date, amount, id", {
+        .select("customer_id, payment_date, amount, id, notes, created_at", {
           count: from === 0 ? "exact" : undefined,
         })
         .order("payment_date", { ascending: false })
@@ -302,6 +325,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
 
   if (canUseSales) {
     for (const sale of sales) {
+      if (sale.status !== "completed") continue;
       const billedCents = toCents(Number(sale.total_amount));
       const salePaidCents = toCents(Number(sale.amount_paid));
       const totals = totalsByCustomer.get(sale.customer_id) ?? {
@@ -340,11 +364,18 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     }
   }
 
+  const completedSales = sales.filter((sale) => sale.status === "completed");
   const allTimeBilledCents = canUseSales
-    ? sales.reduce((sum, sale) => sum + toCents(Number(sale.total_amount)), 0)
+    ? completedSales.reduce(
+        (sum, sale) => sum + toCents(Number(sale.total_amount)),
+        0,
+      )
     : null;
   const allTimePaidCents = canCalculateCollected
-    ? sales.reduce((sum, sale) => sum + toCents(Number(sale.amount_paid)), 0) +
+    ? completedSales.reduce(
+        (sum, sale) => sum + toCents(Number(sale.amount_paid)),
+        0,
+      ) +
       payments.reduce((sum, payment) => sum + toCents(Number(payment.amount)), 0)
     : null;
   const outstandingCents = canCalculateCollected
@@ -434,6 +465,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       outstandingCents === null ? null : fromCents(outstandingCents),
     dailyTotals,
     recentSales: canUseSales ? sales.slice(0, 25) : [],
+    recentPayments: canCalculateCollected ? payments.slice(0, 25) : [],
     salesAvailable,
     salesComplete,
     paymentsAvailable,
@@ -514,6 +546,8 @@ export async function addDailySale(input: {
   quantity: number;
   ratePerUnit: number;
   amountPaid?: number;
+  discount?: number;
+  paymentMethod?: "cash" | "upi";
   saleDate?: string;
   notes?: string;
 }): Promise<{
@@ -541,6 +575,15 @@ export async function addDailySale(input: {
   ) {
     throw new Error("Amount paid cannot be negative.");
   }
+  const gross = Math.round(input.quantity * input.ratePerUnit * 100) / 100;
+  const discount = Math.round((input.discount ?? 0) * 100) / 100;
+  if (!Number.isFinite(discount) || discount < 0 || discount > gross) {
+    throw new Error("Discount must be between zero and the bill total.");
+  }
+  const total = Math.round((gross - discount) * 100) / 100;
+  if ((input.amountPaid ?? 0) > total) {
+    throw new Error("Amount paid cannot be more than the sale total.");
+  }
 
   const { data, error } = await getSupabaseClient().rpc("add_sale", {
     p_customer_id: input.customerId,
@@ -550,11 +593,98 @@ export async function addDailySale(input: {
     p_amount_paid: input.amountPaid ?? 0,
     p_sale_date: input.saleDate || new Date().toISOString().slice(0, 10),
     p_notes: input.notes?.trim() || null,
+    p_discount: discount,
+    p_payment_method: input.paymentMethod ?? "cash",
   });
   const result = requireData(data, error);
   const sale = result[0];
   if (!sale) throw new Error("Sale was not created.");
   return sale;
+}
+
+export async function updateSale(input: {
+  saleId: string;
+  saleUnit: "500g" | "1kg" | "bulk";
+  quantity: number;
+  ratePerUnit: number;
+  amountPaid?: number;
+  discount?: number;
+  paymentMethod?: "cash" | "upi";
+  saleDate?: string;
+  notes?: string;
+}): Promise<{
+  id: string;
+  total_amount: number;
+  amount_paid: number;
+  balance: number;
+}> {
+  if (!input.saleId) throw new Error("Sale ID is required.");
+  if (!Number.isFinite(input.quantity) || input.quantity <= 0) {
+    throw new Error("Quantity must be greater than zero.");
+  }
+  if (
+    input.saleUnit !== "bulk" &&
+    (!Number.isInteger(input.quantity) || input.quantity < 1)
+  ) {
+    throw new Error("Packet quantity must be a whole number.");
+  }
+  if (!Number.isFinite(input.ratePerUnit) || input.ratePerUnit < 0.01) {
+    throw new Error("Rate per unit must be at least 0.01.");
+  }
+  const gross = Math.round(input.quantity * input.ratePerUnit * 100) / 100;
+  const discount = Math.round((input.discount ?? 0) * 100) / 100;
+  if (!Number.isFinite(discount) || discount < 0 || discount > gross) {
+    throw new Error("Discount must be between zero and the bill total.");
+  }
+  const total = Math.round((gross - discount) * 100) / 100;
+  if ((input.amountPaid ?? 0) < 0 || (input.amountPaid ?? 0) > total) {
+    throw new Error("Amount paid must be between zero and the sale total.");
+  }
+
+  const { data, error } = await getSupabaseClient().rpc("update_sale", {
+    p_sale_id: input.saleId,
+    p_sale_unit: input.saleUnit,
+    p_quantity: input.quantity,
+    p_rate_per_unit: input.ratePerUnit,
+    p_amount_paid: input.amountPaid ?? 0,
+    p_discount: discount,
+    p_payment_method: input.paymentMethod ?? "cash",
+    p_sale_date: input.saleDate || new Date().toISOString().slice(0, 10),
+    p_notes: input.notes?.trim() || null,
+  });
+  const result = requireData(data, error);
+  const sale = result[0];
+  if (!sale) throw new Error("Sale was not updated.");
+  return sale;
+}
+
+export async function cancelSale(
+  saleId: string,
+  reason?: string,
+): Promise<void> {
+  if (!saleId) throw new Error("Sale ID is required.");
+  const { error } = await getSupabaseClient().rpc("cancel_sale", {
+    p_sale_id: saleId,
+    p_reason: reason?.trim() || null,
+  });
+  if (error) throw new Error(error.message);
+}
+
+export async function fetchSalesHistory(): Promise<SaleRecord[]> {
+  const supabase = getSupabaseClient();
+  const result = await fetchAllPages<SaleRecord>(async (from, to) =>
+    await supabase
+      .from("sales")
+      .select(
+        "id, customer_id, sale_date, total_amount, amount_paid, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
+        { count: from === 0 ? "exact" : undefined },
+      )
+      .order("sale_date", { ascending: false })
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .range(from, to),
+  );
+  return result.rows;
 }
 
 export async function fetchDashboardStats(
@@ -604,7 +734,7 @@ export async function fetchCustomerLedger(
     supabase
       .from("sales")
       .select(
-        "id, sale_date, quantity_kg, unit_price, sale_unit, sale_quantity, rate_per_unit, total_amount, amount_paid, balance, notes, created_at",
+        "id, sale_date, quantity_kg, unit_price, sale_unit, sale_quantity, rate_per_unit, total_amount, amount_paid, balance, notes, status, created_at",
       )
       .eq("customer_id", customerId),
     supabase
@@ -616,21 +746,23 @@ export async function fetchCustomerLedger(
   const payments = requireData(paymentsResult.data, paymentsResult.error);
 
   const entries: LedgerEntry[] = [
-    ...sales.map((sale): LedgerEntry => ({
-      id: sale.id,
-      kind: "sale",
-      date: sale.sale_date,
-      description: sale.notes || "Cane sugar sale",
-      quantity_kg: Number(sale.quantity_kg),
-      unit_price: Number(sale.unit_price),
-      sale_unit: sale.sale_unit,
-      sale_quantity: Number(sale.sale_quantity),
-      rate_per_unit: Number(sale.rate_per_unit),
-      debit: Number(sale.total_amount),
-      credit: Number(sale.amount_paid),
-      balance: Number(sale.balance),
-      created_at: sale.created_at,
-    })),
+    ...sales
+      .filter((sale) => sale.status === "completed")
+      .map((sale): LedgerEntry => ({
+        id: sale.id,
+        kind: "sale",
+        date: sale.sale_date,
+        description: sale.notes || "Cane sugar sale",
+        quantity_kg: Number(sale.quantity_kg),
+        unit_price: Number(sale.unit_price),
+        sale_unit: sale.sale_unit,
+        sale_quantity: Number(sale.sale_quantity),
+        rate_per_unit: Number(sale.rate_per_unit),
+        debit: Number(sale.total_amount),
+        credit: Number(sale.amount_paid),
+        balance: Number(sale.balance),
+        created_at: sale.created_at,
+      })),
     ...payments.map((payment): LedgerEntry => ({
       id: payment.id,
       kind: "payment",
@@ -686,7 +818,7 @@ export async function fetchStockOverview(): Promise<StockOverview> {
     fetchAllPages<StockSaleRow>(async (from, to) =>
       await supabase
         .from("sales")
-        .select("sale_unit, sale_quantity, sale_date, created_at", {
+        .select("sale_unit, sale_quantity, sale_date, status, created_at", {
           count: from === 0 ? "exact" : undefined,
         })
         .order("sale_date", { ascending: false })
@@ -739,6 +871,7 @@ export async function fetchStockOverview(): Promise<StockOverview> {
     units[unit].trackingSince = firstEntry?.added_on ?? null;
   }
   for (const sale of sales) {
+    if (sale.status !== "completed") continue;
     const since = units[sale.sale_unit].trackingSince;
     if (since && sale.sale_date >= since) {
       units[sale.sale_unit].sold += Number(sale.sale_quantity);
@@ -756,7 +889,9 @@ export async function fetchStockOverview(): Promise<StockOverview> {
   for (const entry of entries) {
     soldSinceByEntry[entry.id] = sales.reduce(
       (sum, sale) =>
-        sale.sale_unit === entry.stock_unit && sale.sale_date >= entry.added_on
+        sale.status === "completed" &&
+        sale.sale_unit === entry.stock_unit &&
+        sale.sale_date >= entry.added_on
           ? sum + Number(sale.sale_quantity)
           : sum,
       0,

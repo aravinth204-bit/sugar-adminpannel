@@ -4,6 +4,7 @@ import {
   ArrowDownLeft,
   ArrowLeft,
   ArrowUpRight,
+  Ban,
   Banknote,
   BookOpen,
   Boxes,
@@ -11,10 +12,10 @@ import {
   Check,
   ChevronDown,
   CircleHelp,
-  ClipboardList,
   Edit,
   Eye,
   IndianRupee,
+  LayoutDashboard,
   LoaderCircle,
   LogOut,
   MapPin,
@@ -25,6 +26,7 @@ import {
   Plus,
   Package,
   PackagePlus,
+  Printer,
   RefreshCw,
   Search,
   ShoppingBag,
@@ -44,15 +46,19 @@ import {
   addCustomer,
   addDailySale,
   addStockEntry,
+  cancelSale,
   fetchCustomerLedger,
+  fetchSalesHistory,
   fetchStockOverview,
   getBusinessDate,
   getSupabaseClient,
   recordStandalonePayment,
+  updateSale,
   type Customer,
   type CustomerSummaryResult,
   type DailyTotals,
   type LedgerEntry,
+  type SaleRecord,
   type StockOverview,
   type StockUnit,
 } from "@/lib/supabase";
@@ -106,7 +112,18 @@ function today() {
   return getBusinessDate();
 }
 
-type ModalKind = "customer" | "edit-customer" | "customer-details" | "sale" | "payment" | "ledger" | "stock" | null;
+type ModalKind =
+  | "customer"
+  | "edit-customer"
+  | "customer-details"
+  | "sale"
+  | "edit-sale"
+  | "cancel-sale"
+  | "receipt"
+  | "payment"
+  | "ledger"
+  | "stock"
+  | null;
 
 export default function Home() {
   const [configured, setConfigured] = useState(true);
@@ -127,9 +144,13 @@ export default function Home() {
   const [statusFilter, setStatusFilter] = useState<"all" | "due" | "settled" | "no-sales">("all");
   const [modal, setModal] = useState<ModalKind>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
+  const [selectedSale, setSelectedSale] = useState<SaleRecord | null>(null);
   const [viewingCustomer, setViewingCustomer] = useState<Customer | null>(null);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [salesHistory, setSalesHistory] = useState<SaleRecord[]>([]);
+  const [salesHistoryLoading, setSalesHistoryLoading] = useState(false);
+  const [salesHistoryError, setSalesHistoryError] = useState("");
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
@@ -208,10 +229,32 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (authenticated && activeTab === "stock" && !stock) {
+    if (
+      authenticated &&
+      (activeTab === "stock" || activeTab === "overview") &&
+      !stock
+    ) {
       void refreshStock();
     }
   }, [authenticated, activeTab, stock, refreshStock]);
+
+  const refreshSalesHistory = useCallback(async () => {
+    setSalesHistoryLoading(true);
+    setSalesHistoryError("");
+    try {
+      setSalesHistory(await fetchSalesHistory());
+    } catch (error) {
+      setSalesHistoryError(
+        error instanceof Error ? error.message : "Unable to load sales history.",
+      );
+    } finally {
+      setSalesHistoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (authenticated && activeTab === "sales") void refreshSalesHistory();
+  }, [authenticated, activeTab, refreshSalesHistory]);
 
   const visibleCustomers = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -266,6 +309,22 @@ export default function Home() {
       ? dailyTotals?.collection ?? 0
       : null;
 
+  const monthKey = businessDate.slice(0, 7);
+  const monthLabel = new Intl.DateTimeFormat("en-IN", {
+    month: "long",
+    year: "numeric",
+  }).format(new Date(`${monthKey}-01T12:00:00`));
+  const monthlySales =
+    dashboardData?.salesAvailable &&
+    dashboardData.salesComplete &&
+    !dataStale
+      ? Object.entries(dashboardData.dailyTotals).reduce(
+          (sum, [date, totals]) =>
+            date.startsWith(monthKey) ? sum + (totals.sales ?? 0) : sum,
+          0,
+        )
+      : null;
+
   async function handleSignIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setAuthBusy(true);
@@ -296,6 +355,7 @@ export default function Home() {
     setFormError("");
     setSuccessMessage("");
     setSelectedCustomer(customer ?? null);
+    setSelectedSale(null);
     setModal(kind);
     if ((kind === "ledger" || kind === "customer-details") && customer) {
       setLedgerLoading(true);
@@ -310,10 +370,22 @@ export default function Home() {
     }
   }
 
+  function openSaleModal(
+    kind: "edit-sale" | "cancel-sale" | "receipt",
+    sale: SaleRecord,
+  ) {
+    setFormError("");
+    setSuccessMessage("");
+    setSelectedCustomer(null);
+    setSelectedSale(sale);
+    setModal(kind);
+  }
+
   function closeModal() {
     if (saving) return;
     setModal(null);
     setSelectedCustomer(null);
+    setSelectedSale(null);
     setFormError("");
   }
 
@@ -451,10 +523,13 @@ export default function Home() {
         quantity: Number(form.get("quantity")),
         ratePerUnit: Number(form.get("ratePerUnit")),
         amountPaid: Number(form.get("amountPaid") || 0),
+        discount: Number(form.get("discount") || 0),
+        paymentMethod: form.get("paymentMethod") === "upi" ? "upi" : "cash",
         saleDate: String(form.get("saleDate") ?? today()),
         notes: String(form.get("notes") ?? ""),
       });
       const customersRefreshed = await refreshCustomers();
+      if (activeTab === "sales") void refreshSalesHistory();
       if (viewingCustomer) {
         void fetchCustomerLedger(viewingCustomer.id)
           .then(setLedger)
@@ -470,6 +545,82 @@ export default function Home() {
     } catch (error) {
       if (customerWasCreated) await refreshCustomers();
       setFormError(error instanceof Error ? error.message : "Unable to record sale.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleEditSale(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedSale) return;
+    setSaving(true);
+    setFormError("");
+    const form = new FormData(event.currentTarget);
+    try {
+      const saleUnit = form.get("saleUnit");
+      if (saleUnit !== "500g" && saleUnit !== "1kg" && saleUnit !== "bulk") {
+        throw new Error("Select a valid packet weight.");
+      }
+      await updateSale({
+        saleId: selectedSale.id,
+        saleUnit,
+        quantity: Number(form.get("quantity")),
+        ratePerUnit: Number(form.get("ratePerUnit")),
+        amountPaid: Number(form.get("amountPaid") || 0),
+        discount: Number(form.get("discount") || 0),
+        paymentMethod: form.get("paymentMethod") === "upi" ? "upi" : "cash",
+        saleDate: String(form.get("saleDate") ?? selectedSale.sale_date),
+        notes: String(form.get("notes") ?? ""),
+      });
+      const customersRefreshed = await refreshCustomers();
+      await refreshSalesHistory();
+      if (stock) void refreshStock();
+      if (viewingCustomer) {
+        void fetchCustomerLedger(viewingCustomer.id)
+          .then(setLedger)
+          .catch(() => {});
+      }
+      setModal(null);
+      setSelectedSale(null);
+      setSuccessMessage(
+        customersRefreshed
+          ? "Sale updated and customer balance recalculated."
+          : "Sale updated, but the customer list could not be refreshed. Use Try again to reload it.",
+      );
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Unable to update sale.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleCancelSale(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedSale) return;
+    setSaving(true);
+    setFormError("");
+    const form = new FormData(event.currentTarget);
+    try {
+      await cancelSale(selectedSale.id, String(form.get("reason") ?? ""));
+      const customersRefreshed = await refreshCustomers();
+      await refreshSalesHistory();
+      if (stock) void refreshStock();
+      if (viewingCustomer) {
+        void fetchCustomerLedger(viewingCustomer.id)
+          .then(setLedger)
+          .catch(() => {});
+      }
+      setModal(null);
+      setSelectedSale(null);
+      setSuccessMessage(
+        customersRefreshed
+          ? "Sale cancelled. It is excluded from balances and stock."
+          : "Sale cancelled, but the customer list could not be refreshed. Use Try again to reload it.",
+      );
+    } catch (error) {
+      setFormError(
+        error instanceof Error ? error.message : "Unable to cancel sale.",
+      );
     } finally {
       setSaving(false);
     }
@@ -654,8 +805,8 @@ export default function Home() {
                 : "text-[#717b74] hover:bg-[#f7f8f5] hover:text-[#25372c]"
             }`}
           >
-            <ClipboardList size={18} strokeWidth={1.8} />
-            Overview
+            <LayoutDashboard size={18} strokeWidth={1.8} />
+            Dashboard
           </button>
           <button
             type="button"
@@ -685,7 +836,7 @@ export default function Home() {
             }`}
           >
             <ShoppingBag size={18} strokeWidth={1.8} />
-            Sales
+            Sales &amp; Management
           </button>
           <button
             type="button"
@@ -787,15 +938,15 @@ export default function Home() {
           >
             <div>
               <h2 className="mt-2 text-[27px] font-semibold tracking-[-0.045em] sm:text-[34px]">
-                {activeTab === "overview" && "Daily Packet Sales & Customer Ledger"}
+                {activeTab === "overview" && "Dashboard"}
                 {activeTab === "customers" && "Customer Directory & Balances"}
-                {activeTab === "sales" && "Sales Trends & Recent Transactions"}
+                {activeTab === "sales" && "Sales & Management"}
                 {activeTab === "stock" && "Packet Stock & Inventory"}
               </h2>
               <p className="mt-1.5 max-w-xl text-sm leading-6 text-[#7b847e]">
-                {activeTab === "overview" && "Manage customers, track balances, and keep your sales records current."}
+                {activeTab === "overview" && "Daily sales, collections, pending balances, monthly sales, and stock at a glance."}
                 {activeTab === "customers" && "Search customer records, add new customers, and collect pending dues."}
-                {activeTab === "sales" && "Track daily revenue trends, packet volume, and recent sales transactions."}
+                {activeTab === "sales" && "Record KG or packet sales, take cash or UPI payments, apply discounts, and manage the full sales history."}
                 {activeTab === "stock" && "See how many packets you stocked, how many sold, and how much stock is left in hand."}
               </p>
             </div>
@@ -831,19 +982,20 @@ export default function Home() {
           )}
 
           {activeTab === "overview" && (
-            <section aria-label="Dashboard summary" className="mt-8">
-              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <section aria-label="Dashboard" className="mt-8 space-y-5">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
                 <div>
                   <div className="flex items-center gap-2">
                     <h2 className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]">
                       Business overview
                     </h2>
                     <span className="rounded-full bg-[#edf4eb] px-2.5 py-0.5 text-[11px] font-medium text-[#40684b]">
-                      Live Metrics
+                      Live metrics
                     </span>
                   </div>
                   <p className="mt-1 text-xs text-[#838c85]">
-                    All-time totals and daily operational figures are kept strictly distinct.
+                    Today&apos;s sales, collections, outstanding balances, and
+                    monthly performance.
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -867,58 +1019,69 @@ export default function Home() {
                   )}
                 </div>
               </div>
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                <SummaryCard
-                  label="Total Sales"
-                  value={formatMetric(dashboardData?.totalBilled, dataLoading, dataStale)}
-                  detail="All-time billed sales value"
-                  icon={<Package size={19} />}
-                  accent="amber"
-                />
-                <SummaryCard
-                  label="Total Collected"
-                  value={formatMetric(dashboardData?.totalPaid, dataLoading, dataStale)}
-                  detail="Sale receipts + customer collections"
-                  icon={<Banknote size={19} />}
-                  accent="emerald"
-                />
-                <SummaryCard
-                  label="Outstanding Due"
-                  value={formatMetric(dashboardData?.outstanding, dataLoading, dataStale)}
-                  detail="All-time balance pending recovery"
-                  icon={<IndianRupee size={19} />}
-                  accent="red"
-                />
-                <SummaryCard
-                  label="Total Customers"
-                  value={
-                    dataLoading
-                      ? "Refreshing…"
-                      : dataStale || dashboardData?.totalCustomers == null
-                      ? "Unavailable"
-                      : dashboardData.totalCustomers.toLocaleString("en-IN")
-                  }
-                  detail="Active customers in your register"
-                  icon={<Users size={19} />}
-                  accent="green"
-                />
+
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 <SummaryCard
                   label="Today's Sales"
                   value={formatMetric(dailySales, dataLoading, dataStale)}
-                  detail={`Sales recorded for ${formatBusinessDate(businessDate)}`}
+                  detail={`Sales recorded on ${formatBusinessDate(businessDate)}`}
                   icon={<Package size={19} />}
                   accent="amber"
                 />
                 <SummaryCard
                   label="Today's Collection"
-                  value={formatMetric(dailyCollection, dataLoading, dataStale)}
+                  value={formatMetric(
+                    dailyCollection,
+                    dataLoading,
+                    dataStale,
+                  )}
                   detail={`Collections received on ${formatBusinessDate(businessDate)}`}
                   icon={<Banknote size={19} />}
                   accent="emerald"
                 />
+                <SummaryCard
+                  label="Total Pending Balance"
+                  value={formatMetric(
+                    dashboardData?.outstanding,
+                    dataLoading,
+                    dataStale,
+                  )}
+                  detail="All-time outstanding across customers"
+                  icon={<IndianRupee size={19} />}
+                  accent="red"
+                />
+                <SummaryCard
+                  label={`${monthLabel} Sales`}
+                  value={formatMetric(monthlySales, dataLoading, dataStale)}
+                  detail="Billed sales for the current month"
+                  icon={<Calendar size={19} />}
+                  accent="green"
+                />
               </div>
-              <p className="mt-3 text-xs leading-5 text-[#838c85]">
-                Date convention: Device local business date. Today&apos;s Sales reflects sales booked on the date; Today&apos;s Collection includes spot payments received at sale time plus standalone payments received on that date.
+
+              <div className="grid gap-5 xl:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+                <StockAlerts
+                  data={stock}
+                  loading={stockLoading}
+                  onManage={() => setActiveTab("stock")}
+                />
+                <DashboardTransactions
+                  sales={dashboardData?.recentSales ?? []}
+                  payments={dashboardData?.recentPayments ?? []}
+                  customers={customers}
+                  complete={Boolean(
+                    dashboardData?.salesComplete &&
+                      dashboardData?.paymentsComplete,
+                  )}
+                  onViewAll={() => setActiveTab("sales")}
+                />
+              </div>
+
+              <p className="text-xs leading-5 text-[#838c85]">
+                Date convention: device local business date. Today&apos;s Sales
+                reflects sales booked on the selected date; Today&apos;s
+                Collection includes spot payments received at sale time plus
+                standalone payments received on that date.
               </p>
             </section>
           )}
@@ -1341,36 +1504,48 @@ export default function Home() {
               <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[#e8ece5] bg-white p-5 shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
                 <div>
                   <h3 className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]">
-                    Sales Management
+                    Sales &amp; Management
                   </h3>
-                  <p className="mt-1 text-xs text-[#838c85]">
-                    Chronological packet sales with billed totals, payments, and
-                    balances.
+                  <p className="mt-1 max-w-2xl text-xs leading-5 text-[#838c85]">
+                    Record KG or packet sales, take cash or UPI payments, collect
+                    full or partial amounts, apply discounts, and manage the full
+                    sales history.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  className={primaryButton}
-                  onClick={() => openModal("sale")}
-                >
-                  <Plus size={16} />
-                  New Sale Entry
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className={secondaryButton}
+                    onClick={() => void refreshSalesHistory()}
+                    disabled={salesHistoryLoading}
+                  >
+                    <RefreshCw
+                      size={15}
+                      className={salesHistoryLoading ? "animate-spin" : ""}
+                    />
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    className={primaryButton}
+                    onClick={() => openModal("sale")}
+                  >
+                    <Plus size={16} />
+                    New Sale
+                  </button>
+                </div>
               </div>
 
-              {dashboardData?.salesAvailable && !dataStale ? (
-                <RecentSales
-                  sales={dashboardData.recentSales}
-                  customers={customers}
-                  complete={dashboardData.salesComplete}
-                />
-              ) : (
-                <div className="rounded-2xl border border-dashed border-[#e2e6df] bg-white p-8 text-center text-sm text-[#7b847e]">
-                  {dataLoading
-                    ? "Loading sales data…"
-                    : "No sales recorded yet. Click 'New Sale Entry' to log today's sales."}
-                </div>
-              )}
+              <SalesManagement
+                sales={salesHistory}
+                customers={customers}
+                loading={salesHistoryLoading}
+                error={salesHistoryError}
+                onEdit={(sale) => openSaleModal("edit-sale", sale)}
+                onCancel={(sale) => openSaleModal("cancel-sale", sale)}
+                onReceipt={(sale) => openSaleModal("receipt", sale)}
+                onRetry={() => void refreshSalesHistory()}
+              />
             </div>
           )}
 
@@ -1499,6 +1674,102 @@ export default function Home() {
               error={formError}
               onSubmit={handleNewSale}
               onCancel={closeModal}
+            />
+          )}
+
+          {modal === "edit-sale" && selectedSale && (
+            <SaleForm
+              customers={customers}
+              sale={selectedSale}
+              saving={saving}
+              error={formError}
+              onSubmit={handleEditSale}
+              onCancel={closeModal}
+              submitLabel="Save changes"
+            />
+          )}
+
+          {modal === "cancel-sale" && selectedSale && (
+            <form onSubmit={handleCancelSale} className="space-y-4">
+              <div className="rounded-xl border border-[#f0d9d4] bg-[#fff8f5] p-4">
+                <p className="text-sm font-semibold text-[#8f4030]">
+                  Cancel this sale?
+                </p>
+                <p className="mt-1 text-xs leading-5 text-[#9a6a60]">
+                  The sale will be marked cancelled and removed from customer
+                  balances and stock calculations. This cannot be undone from
+                  the app.
+                </p>
+                <div className="mt-3 space-y-1 border-t border-[#f0d9d4] pt-3 text-xs text-[#7d5a52]">
+                  <div className="flex justify-between gap-3">
+                    <span>Customer</span>
+                    <span className="font-semibold text-[#5e3f38]">
+                      {customers.find(
+                        (customer) => customer.id === selectedSale.customer_id,
+                      )?.name ?? "Customer"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span>Date</span>
+                    <span className="font-semibold text-[#5e3f38]">
+                      {formatDate(selectedSale.sale_date)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span>Items</span>
+                    <span className="font-semibold text-[#5e3f38]">
+                      {saleItemsLabel(selectedSale)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span>Total</span>
+                    <span className="font-semibold text-[#5e3f38]">
+                      {formatMoney(Number(selectedSale.total_amount))}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <Field label="Cancellation reason (optional)">
+                <textarea
+                  className={`${inputClass} min-h-20 resize-y`}
+                  name="reason"
+                  maxLength={300}
+                  placeholder="e.g. Wrong packet size or customer returned the sale"
+                />
+              </Field>
+              <FormError message={formError} />
+              <div className="flex justify-end gap-2 border-t border-[#eef0eb] pt-4">
+                <button
+                  type="button"
+                  className={secondaryButton}
+                  onClick={closeModal}
+                  disabled={saving}
+                >
+                  Keep sale
+                </button>
+                <button
+                  type="submit"
+                  className="inline-flex items-center justify-center gap-2 rounded-lg bg-[#b25543] px-3.5 py-2 text-sm font-semibold text-white transition hover:bg-[#9c4737] disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={saving}
+                >
+                  {saving ? (
+                    <LoaderCircle size={16} className="animate-spin" />
+                  ) : (
+                    <Ban size={16} />
+                  )}
+                  {saving ? "Cancelling…" : "Cancel sale"}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {modal === "receipt" && selectedSale && (
+            <ReceiptView
+              sale={selectedSale}
+              customer={customers.find(
+                (customer) => customer.id === selectedSale.customer_id,
+              )}
+              onClose={closeModal}
             />
           )}
 
@@ -2999,6 +3270,302 @@ function CustomerActionsMenu({
   );
 }
 
+function StockAlerts({
+  data,
+  loading,
+  onManage,
+}: {
+  data: StockOverview | null;
+  loading: boolean;
+  onManage: () => void;
+}) {
+  const units = STOCK_UNIT_ORDER.map((unit) => ({
+    unit,
+    meta: STOCK_UNIT_META[unit],
+    summary: data?.units[unit],
+  }));
+  const alerts = units.filter(({ meta, summary }) => {
+    if (!summary) return false;
+    const threshold = meta.isBulk ? 10 : 20;
+    return summary.remaining <= threshold;
+  });
+
+  return (
+    <section className="flex flex-col rounded-2xl border border-[#e8ece5] bg-white p-5 shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-base font-semibold tracking-[-0.02em] text-[#29382e]">
+              Stock alerts
+            </h3>
+            {data?.available && (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                  alerts.length
+                    ? "bg-red-50 text-red-700"
+                    : "bg-emerald-50 text-emerald-800"
+                }`}
+              >
+                {alerts.length
+                  ? `${alerts.length} need attention`
+                  : "All clear"}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 text-xs text-[#838c85]">
+            Packet sizes that are low or out of stock.
+          </p>
+        </div>
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#edf4eb] text-[#52795a]">
+          <Boxes size={18} />
+        </span>
+      </div>
+
+      {loading && !data ? (
+        <div className="flex flex-1 items-center justify-center gap-2 py-10 text-sm text-[#7c867e]">
+          <LoaderCircle size={16} className="animate-spin" />
+          Checking stock…
+        </div>
+      ) : !data?.available ? (
+        <div className="mt-4 flex-1 rounded-xl border border-dashed border-[#e2e6df] bg-[#fafbf9] px-4 py-6 text-center">
+          <p className="text-sm font-semibold text-[#405046]">
+            Stock tracking is not set up
+          </p>
+          <p className="mt-1 text-xs leading-5 text-[#8a938c]">
+            Apply the stock migration and add your first stock entry to see
+            alerts here.
+          </p>
+        </div>
+      ) : alerts.length === 0 ? (
+        <div className="mt-4 flex flex-1 items-center gap-2.5 rounded-xl border border-[#dceade] bg-[#f3f9f1] px-4 py-5">
+          <Check size={18} className="shrink-0 text-[#3f7a56]" />
+          <div>
+            <p className="text-sm font-semibold text-[#356347]">
+              Stock levels look healthy
+            </p>
+            <p className="mt-0.5 text-xs text-[#6f8674]">
+              No packet size is running low right now.
+            </p>
+          </div>
+        </div>
+      ) : (
+        <ul className="mt-4 flex-1 space-y-2">
+          {alerts.map(({ unit, meta, summary }) => {
+            const remaining = summary?.remaining ?? 0;
+            const empty = remaining <= 0;
+            return (
+              <li
+                key={unit}
+                className={`flex items-center justify-between gap-3 rounded-xl border px-3.5 py-2.5 ${
+                  empty
+                    ? "border-[#f3d9d4] bg-[#fff7f4]"
+                    : "border-[#f0e4c8] bg-[#fffcf2]"
+                }`}
+              >
+                <div className="min-w-0">
+                  <span className="block text-xs font-semibold text-[#3d4c40]">
+                    {meta.label}
+                  </span>
+                  <span className="mt-0.5 block text-[11px] text-[#8b958d]">
+                    {formatStockQty(remaining, meta.isBulk)} {meta.unitLabel}{" "}
+                    left in hand
+                  </span>
+                </div>
+                <span
+                  className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                    empty
+                      ? "bg-red-100 text-red-700"
+                      : "bg-amber-100 text-amber-800"
+                  }`}
+                >
+                  {empty ? "Out of stock" : "Low stock"}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      <button
+        type="button"
+        onClick={onManage}
+        className="mt-4 inline-flex items-center justify-center gap-1.5 rounded-lg border border-[#e2e7e0] bg-white px-3 py-2 text-xs font-semibold text-[#445248] transition hover:bg-[#f6f8f5]"
+      >
+        Manage stock
+        <ArrowUpRight size={13} />
+      </button>
+    </section>
+  );
+}
+
+function DashboardTransactions({
+  sales,
+  payments,
+  customers,
+  complete,
+  onViewAll,
+}: {
+  sales: CustomerSummaryResult["recentSales"];
+  payments: CustomerSummaryResult["recentPayments"];
+  customers: Customer[];
+  complete: boolean;
+  onViewAll: () => void;
+}) {
+  const customerNames = new Map(
+    customers.map((customer) => [customer.id, customer.name]),
+  );
+
+  const rows: Array<{
+    key: string;
+    kind: "sale" | "payment";
+    customerId: string;
+    date: string;
+    createdAt: string;
+    amount: number;
+    balance: number | null;
+    status: "completed" | "cancelled" | null;
+  }> = [
+    ...sales.map((sale) => ({
+      key: `sale-${sale.id}`,
+      kind: "sale" as const,
+      customerId: sale.customer_id,
+      date: sale.sale_date,
+      createdAt: sale.created_at,
+      amount: Number(sale.total_amount),
+      balance: Number(sale.balance),
+      status: sale.status,
+    })),
+    ...payments.map((payment) => ({
+      key: `payment-${payment.id}`,
+      kind: "payment" as const,
+      customerId: payment.customer_id,
+      date: payment.payment_date,
+      createdAt: payment.created_at,
+      amount: Number(payment.amount),
+      balance: null,
+      status: null,
+    })),
+  ]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, 8);
+
+  return (
+    <section className="flex flex-col overflow-hidden rounded-2xl border border-[#e8ece5] bg-white shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#eef0eb] px-5 py-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <h3 className="text-base font-semibold tracking-[-0.02em] text-[#29382e]">
+              Recent transactions
+            </h3>
+            <span className="rounded-full bg-[#edf4eb] px-2 py-0.5 text-[10px] font-semibold text-[#456c4e]">
+              Latest {rows.length}
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-[#838c85]">
+            Latest sales and payments across your ledger.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onViewAll}
+          className="inline-flex items-center gap-1 text-xs font-semibold text-[#285d42] transition hover:underline"
+        >
+          View all
+          <ArrowUpRight size={13} />
+        </button>
+      </div>
+
+      {!complete && (
+        <p className="border-b border-amber-100 bg-amber-50 px-5 py-2 text-[11px] leading-5 text-amber-800">
+          Some transaction data is unavailable, so this list may be incomplete.
+        </p>
+      )}
+
+      {rows.length === 0 ? (
+        <div className="flex flex-1 flex-col items-center justify-center px-5 py-10 text-center">
+          <ShoppingBag className="text-[#8ca18d]" size={22} />
+          <p className="mt-2 text-sm font-semibold text-[#405046]">
+            No transactions yet
+          </p>
+          <p className="mt-1 text-xs text-[#8a938c]">
+            Sales and payments you record will show up here.
+          </p>
+        </div>
+      ) : (
+        <ul className="flex-1 divide-y divide-[#eef0eb]">
+          {rows.map((row) => (
+            <li
+              key={row.key}
+              className="flex items-center justify-between gap-3 px-5 py-3"
+            >
+              <div className="flex min-w-0 items-center gap-3">
+                <span
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
+                    row.kind === "sale"
+                      ? "bg-amber-50 text-amber-700"
+                      : "bg-emerald-50 text-emerald-700"
+                  }`}
+                >
+                  {row.kind === "sale" ? (
+                    <ShoppingBag size={15} />
+                  ) : (
+                    <Banknote size={15} />
+                  )}
+                </span>
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-[#29382e]">
+                    {customerNames.get(row.customerId) ?? "Customer"}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-[#8e9891]">
+                    {formatDate(row.date)} ·{" "}
+                    {row.kind === "sale" ? "Sale" : "Payment"}
+                    {row.status === "cancelled" ? " · Cancelled" : ""}
+                  </p>
+                </div>
+              </div>
+              <div className="shrink-0 text-right">
+                <p
+                  className={`text-sm font-bold ${
+                    row.status === "cancelled"
+                      ? "text-[#9aa39b] line-through"
+                      : row.kind === "payment"
+                        ? "text-emerald-700"
+                        : "text-[#29382e]"
+                  }`}
+                >
+                  {row.kind === "payment" ? "+" : ""}
+                  {formatMoney(row.amount)}
+                </p>
+                <p
+                  className={`mt-0.5 text-[10px] ${
+                    row.status === "cancelled"
+                      ? "text-[#9aa39b]"
+                      : row.kind === "sale" && (row.balance ?? 0) > 0
+                        ? "text-red-600"
+                        : "text-[#98a19a]"
+                  }`}
+                >
+                  {row.status === "cancelled"
+                    ? "Cancelled"
+                    : row.kind === "sale"
+                      ? (row.balance ?? 0) > 0
+                        ? `${formatMoney(row.balance ?? 0)} due`
+                        : "Fully paid"
+                      : "Payment received"}
+                </p>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-2.5 text-[11px] text-[#8d968e]">
+        Newest transactions first
+      </div>
+    </section>
+  );
+}
+
 function SummaryCard({
   label,
   value,
@@ -3041,76 +3608,167 @@ function SummaryCard({
   );
 }
 
-function RecentSales({
+function saleItemsLabel(sale: SaleRecord) {
+  return sale.sale_unit === "bulk"
+    ? `${Number(sale.sale_quantity)} kg bulk`
+    : `${Number(sale.sale_quantity)} × ${sale.sale_unit}`;
+}
+
+function paymentMethodLabel(method: SaleRecord["payment_method"]) {
+  return method === "upi" ? "UPI" : "Cash";
+}
+
+function saleStatusBadge(sale: SaleRecord) {
+  if (sale.status === "cancelled") {
+    return { label: "Cancelled", className: "bg-slate-100 text-slate-600" };
+  }
+  const balance = Number(sale.balance);
+  const paid = Number(sale.amount_paid);
+  if (balance <= 0) {
+    return { label: "Paid", className: "bg-emerald-50 text-emerald-800" };
+  }
+  if (paid > 0) {
+    return { label: "Partial", className: "bg-amber-50 text-amber-700" };
+  }
+  return { label: "Unpaid", className: "bg-red-50 text-red-700" };
+}
+
+function SalesManagement({
   sales,
   customers,
-  complete,
+  loading,
+  error,
+  onEdit,
+  onCancel,
+  onReceipt,
+  onRetry,
 }: {
-  sales: CustomerSummaryResult["recentSales"];
+  sales: SaleRecord[];
   customers: Customer[];
-  complete: boolean;
+  loading: boolean;
+  error: string;
+  onEdit: (sale: SaleRecord) => void;
+  onCancel: (sale: SaleRecord) => void;
+  onReceipt: (sale: SaleRecord) => void;
+  onRetry: () => void;
 }) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<
+    "all" | "completed" | "cancelled"
+  >("all");
+  const [paymentFilter, setPaymentFilter] = useState<"all" | "cash" | "upi">(
+    "all",
+  );
   const customerMap = new Map(
     customers.map((customer) => [customer.id, customer]),
   );
-  const shownBilled = sales.reduce(
+
+  const query = search.trim().toLowerCase();
+  const filtered = sales.filter((sale) => {
+    const customer = customerMap.get(sale.customer_id);
+    const matchesSearch =
+      !query ||
+      (customer?.name ?? "").toLowerCase().includes(query) ||
+      (customer?.phone ?? "").toLowerCase().includes(query) ||
+      (sale.notes ?? "").toLowerCase().includes(query);
+    const matchesStatus =
+      statusFilter === "all" || sale.status === statusFilter;
+    const matchesPayment =
+      paymentFilter === "all" || sale.payment_method === paymentFilter;
+    return matchesSearch && matchesStatus && matchesPayment;
+  });
+
+  const completed = filtered.filter((sale) => sale.status === "completed");
+  const billed = completed.reduce(
     (sum, sale) => sum + Number(sale.total_amount),
     0,
   );
-  const shownPaid = sales.reduce(
+  const collected = completed.reduce(
     (sum, sale) => sum + Number(sale.amount_paid),
     0,
   );
-  const shownDue = sales.reduce(
+  const outstanding = completed.reduce(
     (sum, sale) => sum + Math.max(0, Number(sale.balance)),
     0,
   );
+  const discounts = completed.reduce(
+    (sum, sale) => sum + Number(sale.discount_amount),
+    0,
+  );
+  const cashCollected = completed
+    .filter((sale) => sale.payment_method === "cash")
+    .reduce((sum, sale) => sum + Number(sale.amount_paid), 0);
+  const upiCollected = completed
+    .filter((sale) => sale.payment_method === "upi")
+    .reduce((sum, sale) => sum + Number(sale.amount_paid), 0);
+  const cancelledCount = filtered.filter(
+    (sale) => sale.status === "cancelled",
+  ).length;
 
-  function itemsLabel(sale: CustomerSummaryResult["recentSales"][number]) {
-    return sale.sale_unit === "bulk"
-      ? `${Number(sale.sale_quantity)} kg`
-      : `${Number(sale.sale_quantity)} × ${sale.sale_unit}`;
-  }
-
-  function statusFor(sale: CustomerSummaryResult["recentSales"][number]) {
-    const balance = Number(sale.balance);
-    const paid = Number(sale.amount_paid);
-    if (balance <= 0) {
-      return {
-        label: "Paid",
-        className: "bg-emerald-50 text-emerald-800",
-      };
-    }
-    if (paid > 0) {
-      return {
-        label: "Partial",
-        className: "bg-amber-50 text-amber-700",
-      };
-    }
-    return { label: "Unpaid", className: "bg-red-50 text-red-700" };
-  }
+  const summaryItems = [
+    {
+      label: "Entries shown",
+      value: filtered.length.toLocaleString("en-IN"),
+      tone: "text-[#29382e]",
+    },
+    {
+      label: "Billed",
+      value: formatMoney(billed),
+      tone: "text-[#29382e]",
+    },
+    {
+      label: "Collected at sale",
+      value: formatMoney(collected),
+      tone: "text-[#285d42]",
+    },
+    {
+      label: "Cash",
+      value: formatMoney(cashCollected),
+      tone: "text-emerald-700",
+    },
+    {
+      label: "UPI",
+      value: formatMoney(upiCollected),
+      tone: "text-sky-700",
+    },
+    {
+      label: "Outstanding at sale",
+      value: formatMoney(outstanding),
+      tone: outstanding > 0 ? "text-red-600" : "text-emerald-700",
+    },
+    {
+      label: "Discounts",
+      value: formatMoney(discounts),
+      tone: "text-[#9a6133]",
+    },
+  ];
 
   return (
     <section
-      aria-labelledby="recent-sales-heading"
+      aria-labelledby="sales-management-heading"
       className="overflow-hidden rounded-2xl border border-[#e8ece5] bg-white shadow-[0_2px_8px_rgba(24,40,30,0.03)]"
     >
       <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#eef0eb] px-5 py-5 sm:px-6">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <h2
-              id="recent-sales-heading"
+              id="sales-management-heading"
               className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]"
             >
-              Recent sales
+              Sales history
             </h2>
             <span className="rounded-full bg-[#edf4eb] px-2 py-0.5 text-[10px] font-semibold text-[#456c4e]">
-              Latest Entries
+              KG / Packet · Cash / UPI
             </span>
+            {cancelledCount > 0 && (
+              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                {cancelledCount} cancelled
+              </span>
+            )}
           </div>
           <p className="mt-1 text-xs text-[#838c85]">
-            Chronological sale entries with billed totals, payments, and
-            balances. Newest first.
+            Every sale with discount, payment method, edit, cancel, and receipt
+            actions. Newest first.
           </p>
         </div>
         <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#edf4eb] text-[#52795a]">
@@ -3118,29 +3776,8 @@ function RecentSales({
         </span>
       </div>
 
-      <div className="grid grid-cols-2 gap-px border-b border-[#eef0eb] bg-[#eef0eb] sm:grid-cols-4">
-        {[
-          {
-            label: "Entries shown",
-            value: sales.length.toLocaleString("en-IN"),
-            tone: "text-[#29382e]",
-          },
-          {
-            label: "Billed value",
-            value: formatMoney(shownBilled),
-            tone: "text-[#29382e]",
-          },
-          {
-            label: "Paid at sale",
-            value: formatMoney(shownPaid),
-            tone: "text-[#285d42]",
-          },
-          {
-            label: "Outstanding",
-            value: formatMoney(shownDue),
-            tone: shownDue > 0 ? "text-red-600" : "text-emerald-700",
-          },
-        ].map((item) => (
+      <div className="grid grid-cols-2 gap-px border-b border-[#eef0eb] bg-[#eef0eb] sm:grid-cols-4 xl:grid-cols-7">
+        {summaryItems.map((item) => (
           <div key={item.label} className="bg-[#fbfcfa] px-5 py-3.5 sm:px-6">
             <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#8d968e]">
               {item.label}
@@ -3154,50 +3791,116 @@ function RecentSales({
         ))}
       </div>
 
-      {!complete && (
-        <p className="border-b border-amber-100 bg-amber-50 px-5 py-2.5 text-xs leading-5 text-amber-800">
-          Showing the newest available entries only. All-time totals are withheld
-          because the sales history exceeds the safe read limit.
-        </p>
+      <div className="flex flex-col gap-2.5 border-b border-[#eef0eb] bg-white px-5 py-3.5 sm:flex-row sm:flex-wrap sm:items-center sm:px-6">
+        <div className="relative min-w-0 flex-1 sm:max-w-xs">
+          <Search
+            size={15}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#96a098]"
+          />
+          <input
+            className={`${inputClass} !mt-0 pl-9`}
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search customer, phone, or note"
+            aria-label="Search sales"
+          />
+        </div>
+        <select
+          className={`${inputClass} !mt-0 sm:w-40`}
+          value={statusFilter}
+          onChange={(event) =>
+            setStatusFilter(
+              event.target.value as "all" | "completed" | "cancelled",
+            )
+          }
+          aria-label="Filter by status"
+        >
+          <option value="all">All statuses</option>
+          <option value="completed">Completed</option>
+          <option value="cancelled">Cancelled</option>
+        </select>
+        <select
+          className={`${inputClass} !mt-0 sm:w-36`}
+          value={paymentFilter}
+          onChange={(event) =>
+            setPaymentFilter(event.target.value as "all" | "cash" | "upi")
+          }
+          aria-label="Filter by payment method"
+        >
+          <option value="all">All payments</option>
+          <option value="cash">Cash</option>
+          <option value="upi">UPI</option>
+        </select>
+        <span className="text-[11px] text-[#8d968e] sm:ml-auto">
+          {filtered.length} of {sales.length} sale
+          {sales.length === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      {error && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-amber-100 bg-amber-50 px-5 py-3 text-xs text-amber-900 sm:px-6">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="rounded-lg border border-amber-200 bg-white px-2.5 py-1 font-semibold text-amber-900"
+            onClick={onRetry}
+          >
+            Try again
+          </button>
+        </div>
       )}
 
-      {sales.length === 0 ? (
+      {loading && sales.length === 0 ? (
+        <div className="flex items-center justify-center gap-2 px-5 py-14 text-sm text-[#7c867e]">
+          <LoaderCircle size={16} className="animate-spin" />
+          Loading sales history…
+        </div>
+      ) : filtered.length === 0 ? (
         <div className="px-5 py-14 text-center">
           <ShoppingBag className="mx-auto text-[#8ca18d]" size={24} />
           <p className="mt-2 text-sm font-semibold text-[#405046]">
-            No sales have been recorded yet
+            {sales.length === 0
+              ? "No sales have been recorded yet"
+              : "No sales match these filters"}
           </p>
           <p className="mt-1 text-xs text-[#8a938c]">
-            Record a sale to see its billed amount, payment, and balance here.
+            {sales.length === 0
+              ? "Record a sale to see its discount, payment method, and balance here."
+              : "Try a different search, status, or payment method."}
           </p>
         </div>
       ) : (
         <>
-          <div className="hidden overflow-x-auto md:block">
-            <table className="w-full min-w-[860px] text-left">
+          <div className="hidden overflow-x-auto lg:block">
+            <table className="w-full min-w-[1080px] text-left">
               <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
                 <tr className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#969e97]">
                   <th className="px-5 py-3">Date</th>
                   <th className="px-4 py-3">Customer</th>
                   <th className="px-4 py-3">Items</th>
+                  <th className="px-4 py-3">Payment</th>
                   <th className="px-4 py-3 text-right">Billed</th>
                   <th className="px-4 py-3 text-right">Paid</th>
-                  <th className="px-4 py-3 text-right">Balance / பாக்கி</th>
-                  <th className="px-5 py-3 text-center">Status</th>
+                  <th className="px-4 py-3 text-right">Balance at sale</th>
+                  <th className="px-4 py-3 text-center">Status</th>
+                  <th className="px-5 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#eef0eb]">
-                {sales.map((sale) => {
+                {filtered.map((sale) => {
                   const customer = customerMap.get(sale.customer_id);
-                  const status = statusFor(sale);
-                  const billed = Number(sale.total_amount);
+                  const status = saleStatusBadge(sale);
+                  const total = Number(sale.total_amount);
                   const paid = Number(sale.amount_paid);
                   const balance = Number(sale.balance);
+                  const isCancelled = sale.status === "cancelled";
 
                   return (
                     <tr
                       key={sale.id}
-                      className="transition-colors hover:bg-[#fafbf9]"
+                      className={`transition-colors hover:bg-[#fafbf9] ${
+                        isCancelled ? "bg-[#fbfbfb] text-[#8b948d]" : ""
+                      }`}
                     >
                       <td className="whitespace-nowrap px-5 py-3.5">
                         <span className="block text-xs font-semibold text-[#37463a]">
@@ -3220,37 +3923,103 @@ function RecentSales({
                       </td>
                       <td className="px-4 py-3.5">
                         <span className="inline-flex rounded-md bg-[#f2f5ef] px-2 py-0.5 text-[11px] font-semibold text-[#5d6c61]">
-                          {itemsLabel(sale)}
+                          {saleItemsLabel(sale)}
                         </span>
                         <span className="mt-1 block text-[10px] text-[#929b93]">
                           @ {formatMoney(Number(sale.rate_per_unit))}
                           {sale.sale_unit === "bulk" ? " / kg" : " each"}
                         </span>
+                        {Number(sale.discount_amount) > 0 && (
+                          <span className="mt-0.5 block text-[10px] font-medium text-[#9a6133]">
+                            Discount {formatMoney(Number(sale.discount_amount))}
+                          </span>
+                        )}
                         {sale.notes && (
-                          <span className="mt-0.5 block max-w-[200px] truncate text-[10px] italic text-[#a0a79f]">
+                          <span className="mt-0.5 block max-w-[190px] truncate text-[10px] italic text-[#a0a79f]">
                             {sale.notes}
                           </span>
                         )}
+                        {sale.status === "cancelled" && sale.cancel_reason && (
+                          <span className="mt-0.5 block max-w-[190px] truncate text-[10px] text-[#9a6a60]">
+                            Cancelled: {sale.cancel_reason}
+                          </span>
+                        )}
                       </td>
-                      <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-semibold text-[#3c4a3f]">
-                        {formatMoney(billed)}
+                      <td className="px-4 py-3.5">
+                        <span
+                          className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                            sale.payment_method === "upi"
+                              ? "bg-sky-50 text-sky-700"
+                              : "bg-emerald-50 text-emerald-700"
+                          }`}
+                        >
+                          {paymentMethodLabel(sale.payment_method)}
+                        </span>
+                      </td>
+                      <td
+                        className={`whitespace-nowrap px-4 py-3.5 text-right text-sm font-semibold ${
+                          isCancelled
+                            ? "text-[#9aa39b] line-through"
+                            : "text-[#3c4a3f]"
+                        }`}
+                      >
+                        {formatMoney(total)}
                       </td>
                       <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-medium text-[#285d42]">
                         {formatMoney(paid)}
                       </td>
                       <td
                         className={`whitespace-nowrap px-4 py-3.5 text-right text-sm font-bold ${
-                          balance > 0 ? "text-red-600" : "text-emerald-700"
+                          isCancelled
+                            ? "text-[#9aa39b]"
+                            : balance > 0
+                              ? "text-red-600"
+                              : "text-emerald-700"
                         }`}
                       >
-                        {formatMoney(balance)}
+                        {isCancelled ? "—" : formatMoney(balance)}
                       </td>
-                      <td className="px-5 py-3.5 text-center">
+                      <td className="px-4 py-3.5 text-center">
                         <span
                           className={`inline-block rounded-full px-2.5 py-0.5 text-[10px] font-bold ${status.className}`}
                         >
                           {status.label}
                         </span>
+                      </td>
+                      <td className="px-5 py-3.5">
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            title="Print receipt"
+                            aria-label={`Print receipt for ${customer?.name ?? "sale"}`}
+                            onClick={() => onReceipt(sale)}
+                            className="rounded-lg border border-[#e6eae4] bg-white p-1.5 text-[#627067] transition hover:bg-[#f3f6f1]"
+                          >
+                            <Printer size={14} />
+                          </button>
+                          {sale.status === "completed" && (
+                            <>
+                              <button
+                                type="button"
+                                title="Edit sale"
+                                aria-label="Edit sale"
+                                onClick={() => onEdit(sale)}
+                                className="rounded-lg border border-[#e6eae4] bg-white p-1.5 text-[#627067] transition hover:bg-[#f3f6f1]"
+                              >
+                                <Edit size={14} />
+                              </button>
+                              <button
+                                type="button"
+                                title="Cancel sale"
+                                aria-label="Cancel sale"
+                                onClick={() => onCancel(sale)}
+                                className="rounded-lg border border-[#f0d9d4] bg-white p-1.5 text-[#b25543] transition hover:bg-[#fff4f1]"
+                              >
+                                <Ban size={14} />
+                              </button>
+                            </>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -3259,16 +4028,20 @@ function RecentSales({
             </table>
           </div>
 
-          <ul className="divide-y divide-[#eef0eb] md:hidden">
-            {sales.map((sale) => {
+          <ul className="divide-y divide-[#eef0eb] lg:hidden">
+            {filtered.map((sale) => {
               const customer = customerMap.get(sale.customer_id);
-              const status = statusFor(sale);
-              const billed = Number(sale.total_amount);
+              const status = saleStatusBadge(sale);
+              const total = Number(sale.total_amount);
               const paid = Number(sale.amount_paid);
               const balance = Number(sale.balance);
+              const isCancelled = sale.status === "cancelled";
 
               return (
-                <li key={sale.id} className="px-4 py-4">
+                <li
+                  key={sale.id}
+                  className={`px-4 py-4 ${isCancelled ? "bg-[#fbfbfb]" : ""}`}
+                >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-1.5">
@@ -3289,24 +4062,45 @@ function RecentSales({
                         {customer?.phone || "No phone"}
                       </p>
                     </div>
-                    <span
-                      className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${status.className}`}
-                    >
-                      {status.label}
-                    </span>
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${status.className}`}
+                      >
+                        {status.label}
+                      </span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                          sale.payment_method === "upi"
+                            ? "bg-sky-50 text-sky-700"
+                            : "bg-emerald-50 text-emerald-700"
+                        }`}
+                      >
+                        {paymentMethodLabel(sale.payment_method)}
+                      </span>
+                    </div>
                   </div>
 
                   <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px] text-[#6e7b71]">
                     <span className="rounded-md bg-[#f2f5ef] px-1.5 py-0.5 font-semibold text-[#5d6c61]">
-                      {itemsLabel(sale)}
+                      {saleItemsLabel(sale)}
                     </span>
                     <span>
                       @ {formatMoney(Number(sale.rate_per_unit))}
                       {sale.sale_unit === "bulk" ? " / kg" : " each"}
                     </span>
+                    {Number(sale.discount_amount) > 0 && (
+                      <span className="font-medium text-[#9a6133]">
+                        · Discount {formatMoney(Number(sale.discount_amount))}
+                      </span>
+                    )}
                     {sale.notes && (
                       <span className="w-full truncate italic text-[#a0a79f]">
                         {sale.notes}
+                      </span>
+                    )}
+                    {sale.status === "cancelled" && sale.cancel_reason && (
+                      <span className="w-full truncate text-[#9a6a60]">
+                        Cancelled: {sale.cancel_reason}
                       </span>
                     )}
                   </div>
@@ -3316,8 +4110,14 @@ function RecentSales({
                       <span className="block text-[10px] text-[#818d83]">
                         Billed
                       </span>
-                      <span className="mt-0.5 block font-semibold text-[#324036]">
-                        {formatMoney(billed)}
+                      <span
+                        className={`mt-0.5 block font-semibold ${
+                          isCancelled
+                            ? "text-[#9aa39b] line-through"
+                            : "text-[#324036]"
+                        }`}
+                      >
+                        {formatMoney(total)}
                       </span>
                     </div>
                     <div>
@@ -3334,12 +4134,47 @@ function RecentSales({
                       </span>
                       <span
                         className={`mt-0.5 block font-bold ${
-                          balance > 0 ? "text-red-600" : "text-emerald-700"
+                          isCancelled
+                            ? "text-[#9aa39b]"
+                            : balance > 0
+                              ? "text-red-600"
+                              : "text-emerald-700"
                         }`}
                       >
-                        {formatMoney(balance)}
+                        {isCancelled ? "—" : formatMoney(balance)}
                       </span>
                     </div>
+                  </div>
+
+                  <div className="mt-3 flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onReceipt(sale)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-[#e6eae4] bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#55645a]"
+                    >
+                      <Printer size={13} />
+                      Receipt
+                    </button>
+                    {sale.status === "completed" && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => onEdit(sale)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[#e6eae4] bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#55645a]"
+                        >
+                          <Edit size={13} />
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onCancel(sale)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[#f0d9d4] bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#b25543]"
+                        >
+                          <Ban size={13} />
+                          Cancel
+                        </button>
+                      </>
+                    )}
                   </div>
                 </li>
               );
@@ -3350,17 +4185,229 @@ function RecentSales({
 
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-[11px] text-[#8d968e]">
         <span>
-          Showing latest {sales.length} sale{sales.length === 1 ? "" : "s"} ·
-          Newest entries first
+          {filtered.length} entr{filtered.length === 1 ? "y" : "ies"} · Newest
+          first · Cancelled sales are excluded from balances and stock · Status
+          reflects payment at sale time
         </span>
         <span className="flex items-center gap-1.5">
           <span className="h-1.5 w-1.5 rounded-full bg-[#6da57a]" />
-          Balance = billed − paid at sale
+          Balance = billed − paid
         </span>
       </div>
     </section>
   );
 }
+
+function ReceiptView({
+  sale,
+  customer,
+  onClose,
+}: {
+  sale: SaleRecord;
+  customer: Customer | undefined;
+  onClose: () => void;
+}) {
+  const total = Number(sale.total_amount);
+  const discount = Number(sale.discount_amount);
+  const gross = total + discount;
+  const paid = Number(sale.amount_paid);
+  const balance = Number(sale.balance);
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-2xl border border-[#e4e8e1] bg-[#fdfcf8] p-5 font-mono text-[11px] leading-5 text-[#3c463d]">
+        <div className="text-center">
+          <p className="text-sm font-bold tracking-[0.2em] text-[#29382e]">
+            KARUMBU SAKKARAI
+          </p>
+          <p className="text-[10px] uppercase tracking-[0.14em] text-[#7d877f]">
+            Cane sugar ledger
+          </p>
+          <p className="mt-1 text-[10px] text-[#8d968e]">
+            Receipt #{sale.id.slice(0, 8).toUpperCase()}
+          </p>
+        </div>
+        <div className="my-3 border-t border-dashed border-[#cfd6cc]" />
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Date</span>
+          <span className="font-semibold">{formatDate(sale.sale_date)}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Customer</span>
+          <span className="text-right font-semibold">
+            {customer?.name ?? "Customer"}
+          </span>
+        </div>
+        {customer?.phone && (
+          <div className="flex justify-between gap-4">
+            <span className="text-[#7d877f]">Phone</span>
+            <span>{customer.phone}</span>
+          </div>
+        )}
+        <div className="my-3 border-t border-dashed border-[#cfd6cc]" />
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Items</span>
+          <span className="text-right font-semibold">
+            {saleItemsLabel(sale)}
+          </span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Rate</span>
+          <span>
+            {formatMoney(Number(sale.rate_per_unit))}
+            {sale.sale_unit === "bulk" ? " / kg" : " each"}
+          </span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Gross</span>
+          <span>{formatMoney(gross)}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Discount</span>
+          <span>- {formatMoney(discount)}</span>
+        </div>
+        <div className="my-3 border-t border-dashed border-[#cfd6cc]" />
+        <div className="flex justify-between gap-4 text-sm font-bold text-[#29382e]">
+          <span>Total</span>
+          <span>{formatMoney(total)}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Paid</span>
+          <span className="font-semibold text-[#285d42]">
+            {formatMoney(paid)}
+          </span>
+        </div>
+        <div className="flex justify-between gap-4 font-bold">
+          <span>Balance</span>
+          <span className={balance > 0 ? "text-red-600" : "text-emerald-700"}>
+            {formatMoney(balance)}
+          </span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#7d877f]">Payment</span>
+          <span className="font-semibold">
+            {paymentMethodLabel(sale.payment_method)}
+          </span>
+        </div>
+        {sale.status === "cancelled" && (
+          <p className="mt-3 rounded-md border border-red-200 bg-red-50 py-1 text-center text-[11px] font-bold tracking-[0.18em] text-red-600">
+            CANCELLED
+          </p>
+        )}
+        {sale.notes && (
+          <p className="mt-3 border-t border-dashed border-[#cfd6cc] pt-2 text-[10px] text-[#7d877f]">
+            Note: {sale.notes}
+          </p>
+        )}
+        {sale.status === "cancelled" && sale.cancel_reason && (
+          <p className="mt-1 text-[10px] text-[#9a6a60]">
+            Cancelled: {sale.cancel_reason}
+          </p>
+        )}
+        <p className="mt-4 text-center text-[10px] text-[#8d968e]">
+          Thank you · Simple books. Strong roots.
+        </p>
+      </div>
+      <div className="flex justify-end gap-2">
+        <button type="button" className={secondaryButton} onClick={onClose}>
+          Close
+        </button>
+        <button
+          type="button"
+          className={primaryButton}
+          onClick={() => printReceipt(sale, customer)}
+        >
+          <Printer size={15} />
+          Print receipt
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (character) => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      default:
+        return "&#39;";
+    }
+  });
+}
+
+function printReceipt(sale: SaleRecord, customer: Customer | undefined) {
+  const total = Number(sale.total_amount);
+  const discount = Number(sale.discount_amount);
+  const gross = total + discount;
+  const paid = Number(sale.amount_paid);
+  const balance = Number(sale.balance);
+  const receiptNumber = sale.id.slice(0, 8).toUpperCase();
+  const windowRef = window.open("", "_blank", "width=420,height=640");
+  if (!windowRef) {
+    window.alert("Allow pop-ups to print the receipt.");
+    return;
+  }
+  windowRef.document.write(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Receipt ${receiptNumber}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #29382e; font-size: 12px; }
+    .receipt { max-width: 360px; margin: 0 auto; }
+    .center { text-align: center; }
+    .brand { font-size: 16px; font-weight: 700; letter-spacing: 3px; margin: 0; }
+    .muted { color: #7d877f; }
+    .small { font-size: 10px; }
+    .divider { border-top: 1px dashed #b9c2b7; margin: 10px 0; }
+    .row { display: flex; justify-content: space-between; gap: 16px; margin: 3px 0; }
+    .strong { font-weight: 700; }
+    .total { font-size: 15px; font-weight: 700; }
+    .cancelled { margin-top: 10px; border: 1px solid #efc4bc; background: #fff4f1; color: #b23b2a; text-align: center; font-weight: 700; letter-spacing: 2px; padding: 4px; }
+    .footer { margin-top: 14px; text-align: center; font-size: 10px; color: #7d877f; }
+    @media print { body { padding: 0; } }
+  </style>
+</head>
+<body>
+  <div class="receipt">
+    <div class="center">
+      <p class="brand">KARUMBU SAKKARAI</p>
+      <div class="small muted">Cane sugar ledger</div>
+      <div class="small muted">Receipt #${escapeHtml(receiptNumber)}</div>
+    </div>
+    <div class="divider"></div>
+    <div class="row"><span class="muted">Date</span><span class="strong">${escapeHtml(formatDate(sale.sale_date))}</span></div>
+    <div class="row"><span class="muted">Customer</span><span class="strong">${escapeHtml(customer?.name ?? "Customer")}</span></div>
+    ${customer?.phone ? `<div class="row"><span class="muted">Phone</span><span>${escapeHtml(customer.phone)}</span></div>` : ""}
+    <div class="divider"></div>
+    <div class="row"><span class="muted">Items</span><span class="strong">${escapeHtml(saleItemsLabel(sale))}</span></div>
+    <div class="row"><span class="muted">Rate</span><span>${escapeHtml(formatMoney(Number(sale.rate_per_unit)))}${sale.sale_unit === "bulk" ? " / kg" : " each"}</span></div>
+    <div class="row"><span class="muted">Gross</span><span>${escapeHtml(formatMoney(gross))}</span></div>
+    <div class="row"><span class="muted">Discount</span><span>- ${escapeHtml(formatMoney(discount))}</span></div>
+    <div class="divider"></div>
+    <div class="row total"><span>Total</span><span>${escapeHtml(formatMoney(total))}</span></div>
+    <div class="row"><span class="muted">Paid</span><span class="strong">${escapeHtml(formatMoney(paid))}</span></div>
+    <div class="row strong"><span>Balance</span><span>${escapeHtml(formatMoney(balance))}</span></div>
+    <div class="row"><span class="muted">Payment</span><span class="strong">${escapeHtml(paymentMethodLabel(sale.payment_method))}</span></div>
+    ${sale.status === "cancelled" ? `<div class="cancelled">CANCELLED</div>` : ""}
+    ${sale.notes ? `<div class="divider"></div><div class="small muted">Note: ${escapeHtml(sale.notes)}</div>` : ""}
+    <div class="footer">Thank you · Simple books. Strong roots.</div>
+  </div>
+  <script>window.onload = function () { window.print(); };</script>
+</body>
+</html>`);
+  windowRef.document.close();
+  windowRef.focus();
+}
+
 
 function Modal({
   title,
@@ -3423,6 +4470,12 @@ function modalTitle(modal: Exclude<ModalKind, null>) {
       return "Customer Details & Ledger";
     case "sale":
       return "Record a daily sale";
+    case "edit-sale":
+      return "Edit sale";
+    case "cancel-sale":
+      return "Cancel sale";
+    case "receipt":
+      return "Sale receipt";
     case "payment":
       return "Record a payment";
     case "ledger":
@@ -3533,54 +4586,91 @@ function CustomerSelect({
 
 function SaleForm({
   customers,
+  sale,
   saving,
   error,
   onSubmit,
   onCancel,
+  submitLabel,
 }: {
   customers: Customer[];
+  sale?: SaleRecord | null;
   saving: boolean;
   error: string;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onCancel: () => void;
+  submitLabel?: string;
 }) {
+  const isEditing = Boolean(sale);
   const [customerId, setCustomerId] = useState(
-    customers.length === 0 ? "__new_customer__" : "",
+    sale
+      ? sale.customer_id
+      : customers.length === 0
+        ? "__new_customer__"
+        : "",
   );
-  const [saleUnit, setSaleUnit] = useState<"500g" | "1kg" | "bulk">("500g");
-  const [quantity, setQuantity] = useState("");
-  const [price, setPrice] = useState("");
-  const [paid, setPaid] = useState("");
-  const bill = Math.round(Number(quantity || 0) * Number(price || 0) * 100) / 100;
-  const balance = Math.max(0, bill - Number(paid || 0));
-  const isNewCustomer = customerId === "__new_customer__";
+  const [saleUnit, setSaleUnit] = useState<"500g" | "1kg" | "bulk">(
+    sale?.sale_unit ?? "500g",
+  );
+  const [quantity, setQuantity] = useState(
+    sale ? String(Number(sale.sale_quantity)) : "",
+  );
+  const [price, setPrice] = useState(
+    sale ? String(Number(sale.rate_per_unit)) : "",
+  );
+  const [paid, setPaid] = useState(
+    sale ? String(Number(sale.amount_paid)) : "",
+  );
+  const [discount, setDiscount] = useState(
+    sale ? String(Number(sale.discount_amount)) : "",
+  );
+  const [paymentMethod, setPaymentMethod] = useState<"cash" | "upi">(
+    sale?.payment_method ?? "cash",
+  );
+  const gross =
+    Math.round(Number(quantity || 0) * Number(price || 0) * 100) / 100;
+  const discountValue = Math.max(0, Number(discount || 0));
+  const total = Math.max(0, Math.round((gross - discountValue) * 100) / 100);
+  const balance = Math.max(0, total - Number(paid || 0));
+  const isNewCustomer = !isEditing && customerId === "__new_customer__";
+  const selectedCustomer = customers.find(
+    (customer) => customer.id === customerId,
+  );
 
   return (
     <form onSubmit={onSubmit} className="space-y-4">
       <Field label="Customer" required>
-        <div className="relative mt-1.5">
-          <select
-            className={`${inputClass} appearance-none pr-10`}
-            name="customerId"
-            required
-            value={customerId}
-            onChange={(event) => setCustomerId(event.target.value)}
-          >
-            <option value="" disabled>
-              Select a customer
-            </option>
-            {customers.map((customer) => (
-              <option key={customer.id} value={customer.id}>
-                {customer.name}
-              </option>
-            ))}
-            <option value="__new_customer__">＋ Create new customer</option>
-          </select>
-          <ChevronDown
-            size={16}
-            className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 text-[#89938b]"
+        {isEditing ? (
+          <input
+            className={`${inputClass} mt-1.5 bg-[#f5f7f3] text-[#6c796f]`}
+            value={selectedCustomer?.name ?? "Customer"}
+            disabled
           />
-        </div>
+        ) : (
+          <div className="relative mt-1.5">
+            <select
+              className={`${inputClass} appearance-none pr-10`}
+              name="customerId"
+              required
+              value={customerId}
+              onChange={(event) => setCustomerId(event.target.value)}
+            >
+              <option value="" disabled>
+                Select a customer
+              </option>
+              {customers.map((customer) => (
+                <option key={customer.id} value={customer.id}>
+                  {customer.name}
+                </option>
+              ))}
+              <option value="__new_customer__">＋ Create new customer</option>
+            </select>
+            <ChevronDown
+              size={16}
+              className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 text-[#89938b]"
+            />
+          </div>
+        )}
       </Field>
       {isNewCustomer && (
         <div className="grid grid-cols-2 gap-3 rounded-xl border border-dashed border-[#dfe6dc] bg-[#fbfcfa] p-3">
@@ -3610,11 +4700,11 @@ function SaleForm({
             className={inputClass}
             type="date"
             name="saleDate"
-            defaultValue={today()}
+            defaultValue={sale?.sale_date ?? today()}
             required
           />
         </Field>
-        <Field label="Packet weight" required>
+        <Field label="Sale type" required>
           <div className="relative mt-1.5">
             <select
               className={`${inputClass} appearance-none pr-10`}
@@ -3629,7 +4719,7 @@ function SaleForm({
             >
               <option value="500g">500 g packet</option>
               <option value="1kg">1 kg packet</option>
-              <option value="bulk">Bulk (per kg)</option>
+              <option value="bulk">Bulk KG (per kg)</option>
             </select>
             <ChevronDown
               size={16}
@@ -3639,7 +4729,10 @@ function SaleForm({
         </Field>
       </div>
       <div className="grid grid-cols-2 gap-3">
-        <Field label={saleUnit === "bulk" ? "Quantity (kg)" : "Quantity (packets)"} required>
+        <Field
+          label={saleUnit === "bulk" ? "Quantity (kg)" : "Quantity (packets)"}
+          required
+        >
           <input
             className={inputClass}
             type="number"
@@ -3652,7 +4745,12 @@ function SaleForm({
             placeholder={saleUnit === "bulk" ? "0.000" : "0"}
           />
         </Field>
-        <Field label={saleUnit === "bulk" ? "Rate per kg (₹)" : "Rate per packet (₹)"} required>
+        <Field
+          label={
+            saleUnit === "bulk" ? "Rate per kg (₹)" : "Rate per packet (₹)"
+          }
+          required
+        >
           <input
             className={inputClass}
             type="number"
@@ -3665,13 +4763,28 @@ function SaleForm({
             placeholder="0.00"
           />
         </Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Discount (₹)">
+          <input
+            className={inputClass}
+            type="number"
+            name="discount"
+            min="0"
+            max={gross.toFixed(2)}
+            step="0.01"
+            value={discount}
+            onChange={(event) => setDiscount(event.target.value)}
+            placeholder="0.00"
+          />
+        </Field>
         <Field label="Paid now (₹)">
           <input
             className={inputClass}
             type="number"
             name="amountPaid"
             min="0"
-            max={bill.toFixed(2)}
+            max={total.toFixed(2)}
             step="0.01"
             value={paid}
             onChange={(event) => setPaid(event.target.value)}
@@ -3679,29 +4792,117 @@ function SaleForm({
           />
         </Field>
       </div>
-      <div className="rounded-xl border border-[#e8eee6] bg-[#f7faf6] p-4">
-        <div className="flex items-center justify-between text-sm text-[#6c796f]">
-          <span>Bill total</span>
-          <span className="font-semibold text-[#35483a]">{formatMoney(bill)}</span>
+      <div className="flex flex-wrap items-center gap-2 text-[11px] text-[#7f8b82]">
+        <span>Quick payment:</span>
+        <button
+          type="button"
+          onClick={() => setPaid(total.toFixed(2))}
+          className="rounded-md border border-[#dfe6dc] bg-white px-2 py-1 font-semibold text-[#456c4e] hover:bg-[#f3f7f1]"
+        >
+          Full amount
+        </button>
+        <button
+          type="button"
+          onClick={() => setPaid((Math.round(total * 50) / 100).toFixed(2))}
+          className="rounded-md border border-[#dfe6dc] bg-white px-2 py-1 font-semibold text-[#6b766d] hover:bg-[#f3f7f1]"
+        >
+          Half
+        </button>
+        <button
+          type="button"
+          onClick={() => setPaid("")}
+          className="rounded-md border border-[#dfe6dc] bg-white px-2 py-1 font-semibold text-[#6b766d] hover:bg-[#f3f7f1]"
+        >
+          No payment
+        </button>
+      </div>
+
+      <div>
+        <p className="text-sm font-medium text-[#48574c]">Payment method</p>
+        <div className="mt-1.5 grid grid-cols-2 gap-2">
+          {(["cash", "upi"] as const).map((method) => {
+            const active = paymentMethod === method;
+            return (
+              <button
+                key={method}
+                type="button"
+                aria-pressed={active}
+                onClick={() => setPaymentMethod(method)}
+                className={`flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm font-semibold transition ${
+                  active
+                    ? "border-[#8eae94] bg-[#edf4eb] text-[#285d42] ring-2 ring-[#e7f0e7]"
+                    : "border-[#e2e6df] bg-white text-[#6c796f] hover:bg-[#f7f9f5]"
+                }`}
+              >
+                {method === "cash" ? (
+                  <Banknote size={16} />
+                ) : (
+                  <IndianRupee size={16} />
+                )}
+                {method === "cash" ? "Cash" : "UPI"}
+              </button>
+            );
+          })}
         </div>
-        <div className="mt-2.5 flex items-center justify-between border-t border-[#e7ede5] pt-2.5 text-sm">
-          <span className="text-[#6c796f]">Added to balance</span>
-          <span className="font-semibold text-[#9a6133]">{formatMoney(balance)}</span>
+        <input type="hidden" name="paymentMethod" value={paymentMethod} />
+      </div>
+
+      <div className="rounded-xl border border-[#e8eee6] bg-[#f7faf6] p-4 text-sm">
+        <div className="flex items-center justify-between text-[#6c796f]">
+          <span>Gross bill</span>
+          <span className="font-semibold text-[#35483a]">
+            {formatMoney(gross)}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center justify-between text-[#6c796f]">
+          <span>Discount</span>
+          <span className="font-semibold text-[#9a6133]">
+            − {formatMoney(Math.min(discountValue, gross))}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center justify-between border-t border-[#e7ede5] pt-2 text-[#35483a]">
+          <span className="font-semibold">Net total</span>
+          <span className="text-base font-bold">{formatMoney(total)}</span>
+        </div>
+        <div className="mt-2 flex items-center justify-between text-[#6c796f]">
+          <span>Paid now</span>
+          <span className="font-semibold text-[#285d42]">
+            {formatMoney(Number(paid || 0))}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center justify-between border-t border-[#e7ede5] pt-2">
+          <span className="text-[#6c796f]">
+            {Number(paid || 0) <= 0
+              ? "Full amount added to balance"
+              : balance > 0
+                ? "Remaining added to balance"
+                : "Fully paid"}
+          </span>
+          <span className="font-semibold text-[#9a6133]">
+            {formatMoney(balance)}
+          </span>
         </div>
       </div>
+
       <Field label="Notes">
         <input
           className={inputClass}
           name="notes"
           maxLength={500}
+          defaultValue={sale?.notes ?? ""}
           placeholder="Optional sale note"
         />
       </Field>
       <FormError message={error} />
-      <ModalActions onCancel={onCancel} saving={saving} submitLabel="Save sale" />
+      <ModalActions
+        onCancel={onCancel}
+        saving={saving}
+        submitLabel={submitLabel ?? "Save sale"}
+      />
     </form>
   );
 }
+
 
 function PaymentForm({
   customers,

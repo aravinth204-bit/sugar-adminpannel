@@ -47,6 +47,11 @@ export type Database = {
           sale_unit: "500g" | "1kg" | "bulk";
           sale_quantity: number;
           rate_per_unit: number;
+          discount_amount: number;
+          payment_method: "cash" | "upi";
+          status: "completed" | "cancelled";
+          cancelled_at: string | null;
+          cancel_reason: string | null;
           created_at: string;
         };
         Insert: {
@@ -62,6 +67,11 @@ export type Database = {
           sale_unit?: "500g" | "1kg" | "bulk";
           sale_quantity?: number;
           rate_per_unit?: number;
+          discount_amount?: number;
+          payment_method?: "cash" | "upi";
+          status?: "completed" | "cancelled";
+          cancelled_at?: string | null;
+          cancel_reason?: string | null;
           created_at?: string;
         };
         Update: {
@@ -77,6 +87,11 @@ export type Database = {
           sale_unit?: "500g" | "1kg" | "bulk";
           sale_quantity?: number;
           rate_per_unit?: number;
+          discount_amount?: number;
+          payment_method?: "cash" | "upi";
+          status?: "completed" | "cancelled";
+          cancelled_at?: string | null;
+          cancel_reason?: string | null;
           created_at?: string;
         };
         Relationships: [];
@@ -158,6 +173,8 @@ export type Database = {
           p_amount_paid?: number;
           p_sale_date?: string;
           p_notes?: string | null;
+          p_discount?: number;
+          p_payment_method?: "cash" | "upi";
         };
         Returns: {
           id: string;
@@ -165,6 +182,32 @@ export type Database = {
           amount_paid: number;
           balance: number;
         }[];
+      };
+      update_sale: {
+        Args: {
+          p_sale_id: string;
+          p_sale_unit: "500g" | "1kg" | "bulk";
+          p_quantity: number;
+          p_rate_per_unit: number;
+          p_amount_paid?: number;
+          p_discount?: number;
+          p_payment_method?: "cash" | "upi";
+          p_sale_date?: string;
+          p_notes?: string | null;
+        };
+        Returns: {
+          id: string;
+          total_amount: number;
+          amount_paid: number;
+          balance: number;
+        }[];
+      };
+      cancel_sale: {
+        Args: {
+          p_sale_id: string;
+          p_reason?: string | null;
+        };
+        Returns: undefined;
       };
       fetch_dashboard_stats: {
         Args: { p_sale_date: string };
