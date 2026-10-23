@@ -645,17 +645,26 @@ export default function Home() {
         paymentDate: String(form.get("paymentDate") ?? today()),
         notes: String(form.get("notes") ?? ""),
       });
+      const paymentCustomerId = String(form.get("customerId") ?? "");
       const customersRefreshed = await refreshCustomers();
-      if (viewingCustomer) {
-        void fetchCustomerLedger(viewingCustomer.id)
-          .then(setLedger)
-          .catch(() => {});
+      let ledgerRefreshed = true;
+      if (
+        viewingCustomer?.id === paymentCustomerId ||
+        selectedCustomer?.id === paymentCustomerId
+      ) {
+        try {
+          setLedger(await fetchCustomerLedger(paymentCustomerId));
+        } catch {
+          ledgerRefreshed = false;
+        }
       }
       setModal(null);
       setSuccessMessage(
-        customersRefreshed
-          ? "Payment recorded against the customer's pending dues."
-          : "Payment recorded, but the customer list could not be refreshed. Use Try again to reload it.",
+        !ledgerRefreshed
+          ? "Payment recorded, but transaction history could not be refreshed. Reopen the customer to reload it."
+          : customersRefreshed
+            ? "Payment recorded against the customer's pending dues."
+            : "Payment recorded, but the customer list could not be refreshed. Use Try again to reload it.",
       );
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Unable to record payment.");

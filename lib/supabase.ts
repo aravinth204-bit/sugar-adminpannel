@@ -734,7 +734,7 @@ export async function fetchCustomerLedger(
     supabase
       .from("sales")
       .select(
-        "id, sale_date, quantity_kg, unit_price, sale_unit, sale_quantity, rate_per_unit, total_amount, amount_paid, balance, notes, status, created_at",
+        "id, sale_date, quantity_kg, unit_price, sale_unit, sale_quantity, rate_per_unit, total_amount, amount_paid, overpaid_amount, balance, notes, status, created_at",
       )
       .eq("customer_id", customerId),
     supabase
@@ -759,7 +759,7 @@ export async function fetchCustomerLedger(
         sale_quantity: Number(sale.sale_quantity),
         rate_per_unit: Number(sale.rate_per_unit),
         debit: Number(sale.total_amount),
-        credit: Number(sale.amount_paid),
+        credit: Number(sale.amount_paid) + Number(sale.overpaid_amount),
         balance: Number(sale.balance),
         created_at: sale.created_at,
       })),
@@ -780,11 +780,18 @@ export async function fetchCustomerLedger(
     })),
   ];
 
-  return entries.sort(
+  const chronological = entries.sort(
     (left, right) =>
-      right.date.localeCompare(left.date) ||
-      right.created_at.localeCompare(left.created_at),
+      left.date.localeCompare(right.date) ||
+      left.created_at.localeCompare(right.created_at),
   );
+  let runningBalance = 0;
+  return chronological
+    .map((entry) => {
+      runningBalance += entry.debit - entry.credit;
+      return { ...entry, balance: runningBalance };
+    })
+    .reverse();
 }
 
 const STOCK_UNITS: StockUnit[] = ["500g", "1kg", "bulk"];
