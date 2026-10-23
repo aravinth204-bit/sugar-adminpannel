@@ -1,6 +1,6 @@
 # Karumbu Ledger
 
-A private sales and khata ledger admin panel for Karumbu Sakkarai (cane sugar), built with Next.js App Router, TypeScript, Tailwind CSS, and Supabase.
+A private sales and customer ledger admin panel for Karumbu Sakkarai (cane sugar), built with Next.js App Router, TypeScript, Tailwind CSS, and Supabase.
 
 ## Getting started
 

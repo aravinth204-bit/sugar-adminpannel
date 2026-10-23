@@ -2,10 +2,11 @@
 
 import {
   ArrowDownLeft,
+  ArrowLeft,
   ArrowUpRight,
   Banknote,
-  BarChart3,
   BookOpen,
+  Boxes,
   Calendar,
   Check,
   ChevronDown,
@@ -19,9 +20,11 @@ import {
   MapPin,
   Menu,
   MessageCircle,
+  MoreVertical,
   Phone,
   Plus,
   Package,
+  PackagePlus,
   RefreshCw,
   Search,
   ShoppingBag,
@@ -34,12 +37,15 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
   addCustomer,
   addDailySale,
+  addStockEntry,
   fetchCustomerLedger,
+  fetchStockOverview,
   getBusinessDate,
   getSupabaseClient,
   recordStandalonePayment,
@@ -47,6 +53,8 @@ import {
   type CustomerSummaryResult,
   type DailyTotals,
   type LedgerEntry,
+  type StockOverview,
+  type StockUnit,
 } from "@/lib/supabase";
 import {
   createCustomer,
@@ -98,7 +106,7 @@ function today() {
   return getBusinessDate();
 }
 
-type ModalKind = "customer" | "edit-customer" | "customer-details" | "sale" | "payment" | "ledger" | null;
+type ModalKind = "customer" | "edit-customer" | "customer-details" | "sale" | "payment" | "ledger" | "stock" | null;
 
 export default function Home() {
   const [configured, setConfigured] = useState(true);
@@ -119,13 +127,17 @@ export default function Home() {
   const [statusFilter, setStatusFilter] = useState<"all" | "due" | "settled" | "no-sales">("all");
   const [modal, setModal] = useState<ModalKind>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
+  const [viewingCustomer, setViewingCustomer] = useState<Customer | null>(null);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [ledgerLoading, setLedgerLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
-  const [activeTab, setActiveTab] = useState<"overview" | "customers" | "sales">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "customers" | "sales" | "stock">("overview");
   const [mobileMenu, setMobileMenu] = useState(false);
+  const [stock, setStock] = useState<StockOverview | null>(null);
+  const [stockLoading, setStockLoading] = useState(false);
+  const [stockError, setStockError] = useState("");
 
   useEffect(() => {
     let supabase: ReturnType<typeof getSupabaseClient>;
@@ -181,6 +193,26 @@ export default function Home() {
     if (authenticated) void refreshCustomers();
   }, [authenticated, refreshCustomers]);
 
+  const refreshStock = useCallback(async () => {
+    setStockLoading(true);
+    setStockError("");
+    try {
+      setStock(await fetchStockOverview());
+    } catch (error) {
+      setStockError(
+        error instanceof Error ? error.message : "Unable to load stock records.",
+      );
+    } finally {
+      setStockLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (authenticated && activeTab === "stock" && !stock) {
+      void refreshStock();
+    }
+  }, [authenticated, activeTab, stock, refreshStock]);
+
   const visibleCustomers = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return customers.filter((customer) => {
@@ -211,6 +243,14 @@ export default function Home() {
       return true;
     });
   }, [customers, query, statusFilter]);
+
+  const activeCustomer = useMemo(() => {
+    if (!viewingCustomer) return null;
+    return (
+      customers.find((customer) => customer.id === viewingCustomer.id) ??
+      viewingCustomer
+    );
+  }, [customers, viewingCustomer]);
 
   const dailyTotals: DailyTotals | undefined =
     dashboardData?.dailyTotals[businessDate];
@@ -274,6 +314,32 @@ export default function Home() {
     if (saving) return;
     setModal(null);
     setSelectedCustomer(null);
+    setFormError("");
+  }
+
+  function openCustomerPage(customer: Customer) {
+    setFormError("");
+    setSuccessMessage("");
+    setViewingCustomer(customer);
+    setLedger([]);
+    setLedgerLoading(true);
+    void fetchCustomerLedger(customer.id)
+      .then(setLedger)
+      .catch((error: unknown) => {
+        setFormError(
+          error instanceof Error
+            ? error.message
+            : "Unable to load transaction history.",
+        );
+      })
+      .finally(() => setLedgerLoading(false));
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function closeCustomerPage() {
+    setViewingCustomer(null);
+    setLedger([]);
+    setLedgerLoading(false);
     setFormError("");
   }
 
@@ -389,6 +455,12 @@ export default function Home() {
         notes: String(form.get("notes") ?? ""),
       });
       const customersRefreshed = await refreshCustomers();
+      if (viewingCustomer) {
+        void fetchCustomerLedger(viewingCustomer.id)
+          .then(setLedger)
+          .catch(() => {});
+      }
+      if (activeTab === "stock" || stock) void refreshStock();
       setModal(null);
       setSuccessMessage(
         customersRefreshed
@@ -416,6 +488,11 @@ export default function Home() {
         notes: String(form.get("notes") ?? ""),
       });
       const customersRefreshed = await refreshCustomers();
+      if (viewingCustomer) {
+        void fetchCustomerLedger(viewingCustomer.id)
+          .then(setLedger)
+          .catch(() => {});
+      }
       setModal(null);
       setSuccessMessage(
         customersRefreshed
@@ -424,6 +501,34 @@ export default function Home() {
       );
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Unable to record payment.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleAddStock(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setFormError("");
+    const form = new FormData(event.currentTarget);
+    const stockUnit = String(form.get("stockUnit") ?? "");
+    try {
+      if (stockUnit !== "500g" && stockUnit !== "1kg" && stockUnit !== "bulk") {
+        throw new Error("Select a valid packet size.");
+      }
+      await addStockEntry({
+        stockUnit: stockUnit as StockUnit,
+        quantity: Number(form.get("quantity")),
+        addedOn: String(form.get("addedOn") ?? today()),
+        note: String(form.get("note") ?? ""),
+      });
+      setModal(null);
+      setSuccessMessage("Stock update saved. Current stock is refreshed below.");
+      await refreshStock();
+    } catch (error) {
+      setFormError(
+        error instanceof Error ? error.message : "Unable to save the stock update.",
+      );
     } finally {
       setSaving(false);
     }
@@ -450,7 +555,7 @@ export default function Home() {
               Welcome back
             </h1>
             <p className="mt-2 text-sm leading-6 text-[#7b847e]">
-              Sign in to manage your cane sugar sales and customer khata.
+              Sign in to manage your cane sugar sales and customer accounts.
             </p>
           </div>
           {configured ? (
@@ -582,6 +687,21 @@ export default function Home() {
             <ShoppingBag size={18} strokeWidth={1.8} />
             Sales
           </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab("stock");
+              setMobileMenu(false);
+            }}
+            className={`mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+              activeTab === "stock"
+                ? "bg-[#eef4ee] text-[#285d42] font-semibold"
+                : "text-[#717b74] hover:bg-[#f7f8f5] hover:text-[#25372c]"
+            }`}
+          >
+            <Boxes size={18} strokeWidth={1.8} />
+            Stock
+          </button>
         </div>
 
         <div className="mt-auto">
@@ -591,7 +711,7 @@ export default function Home() {
             </div>
             <p className="mt-3 text-sm font-semibold text-[#2d3c32]">Need a hand?</p>
             <p className="mt-1 text-xs leading-5 text-[#818b83]">
-              Keep your daily sales and khata up to date in one place.
+              Keep your daily sales and customer balances up to date in one place.
             </p>
           </div>
           <button
@@ -621,7 +741,7 @@ export default function Home() {
               <div>
                 <p className="text-xs text-[#828b84]">Karumbu Sakkarai · Admin</p>
                 <h1 className="mt-0.5 text-lg font-semibold tracking-[-0.03em] sm:text-xl">
-                  கரும்பு சர்க்கரை - Khata Admin
+                  கரும்பு சர்க்கரை - Admin
                 </h1>
                 <p className="mt-0.5 hidden text-xs text-[#828b84] sm:block">
                   Daily Packet Sales &amp; Customer Ledger
@@ -629,23 +749,6 @@ export default function Home() {
               </div>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
-              <button
-                type="button"
-                className={`${secondaryButton} hidden sm:inline-flex`}
-                onClick={() => openModal("customer")}
-              >
-                <Plus size={16} />
-                Add Customer
-              </button>
-              <button
-                type="button"
-                className={primaryButton}
-                onClick={() => openModal("sale")}
-              >
-                <Plus size={16} />
-                <span className="hidden sm:inline">New Sale Entry</span>
-                <span className="sm:hidden">New Sale</span>
-              </button>
               <button
                 type="button"
                 aria-label="Refresh dashboard"
@@ -664,6 +767,20 @@ export default function Home() {
         </header>
 
         <div className="mx-auto max-w-[1440px] px-5 pb-12 pt-7 sm:px-8 sm:pt-9 lg:px-10">
+          {activeCustomer ? (
+            <CustomerProfilePage
+              customer={activeCustomer}
+              entries={ledger}
+              loading={ledgerLoading}
+              error={formError}
+              notice={successMessage}
+              onDismissNotice={() => setSuccessMessage("")}
+              onBack={closeCustomerPage}
+              onReceivePayment={() => openModal("payment", activeCustomer)}
+              onEditCustomer={() => openModal("edit-customer", activeCustomer)}
+            />
+          ) : (
+            <>
           <section
             id="overview"
             className="flex flex-col justify-between gap-5 sm:flex-row sm:items-end"
@@ -673,11 +790,13 @@ export default function Home() {
                 {activeTab === "overview" && "Daily Packet Sales & Customer Ledger"}
                 {activeTab === "customers" && "Customer Directory & Balances"}
                 {activeTab === "sales" && "Sales Trends & Recent Transactions"}
+                {activeTab === "stock" && "Packet Stock & Inventory"}
               </h2>
               <p className="mt-1.5 max-w-xl text-sm leading-6 text-[#7b847e]">
-                {activeTab === "overview" && "Manage customers, track khata balances, and keep your sales records current."}
-                {activeTab === "customers" && "Search customer records, add new customers, and collect pending khata dues."}
+                {activeTab === "overview" && "Manage customers, track balances, and keep your sales records current."}
+                {activeTab === "customers" && "Search customer records, add new customers, and collect pending dues."}
                 {activeTab === "sales" && "Track daily revenue trends, packet volume, and recent sales transactions."}
+                {activeTab === "stock" && "See how many packets you stocked, how many sold, and how much stock is left in hand."}
               </p>
             </div>
           </section>
@@ -759,7 +878,7 @@ export default function Home() {
                 <SummaryCard
                   label="Total Collected"
                   value={formatMetric(dashboardData?.totalPaid, dataLoading, dataStale)}
-                  detail="Sale receipts + khata collections"
+                  detail="Sale receipts + customer collections"
                   icon={<Banknote size={19} />}
                   accent="emerald"
                 />
@@ -779,7 +898,7 @@ export default function Home() {
                       ? "Unavailable"
                       : dashboardData.totalCustomers.toLocaleString("en-IN")
                   }
-                  detail="Active customers in khata register"
+                  detail="Active customers in your register"
                   icon={<Users size={19} />}
                   accent="green"
                 />
@@ -1000,7 +1119,9 @@ export default function Home() {
                           return (
                             <tr
                               key={customer.id}
-                              className="transition hover:bg-[#fafbf9]"
+                              onClick={() => openCustomerPage(customer)}
+                              title={`Open ${customer.name}'s details`}
+                              className="group cursor-pointer transition hover:bg-[#fafbf9]"
                             >
                               <td className="px-5 py-4">
                                 <div className="flex items-center gap-3">
@@ -1008,10 +1129,10 @@ export default function Home() {
                                     {customer.name.trim().charAt(0).toUpperCase()}
                                   </span>
                                   <div>
-                                    <span className="block text-sm font-semibold text-[#29382e]">
+                                    <span className="block text-sm font-semibold text-[#29382e] transition group-hover:text-[#285d42]">
                                       {customer.name}
                                     </span>
-                                    <span className="mt-0.5 block text-[11px] text-[#8e9891]">
+                                    <span className="mt-0.5 flex items-center gap-1 text-[11px] text-[#8e9891]">
                                       Joined {formatDate(customer.created_at)}
                                     </span>
                                   </div>
@@ -1059,44 +1180,22 @@ export default function Home() {
                                   </span>
                                 )}
                               </td>
-                              <td className="px-5 py-4 text-right">
-                                <div className="flex items-center justify-end gap-1.5">
-                                  <button
-                                    type="button"
-                                    title="View Details & Khata"
-                                    className="flex items-center gap-1 rounded-lg border border-[#e2e7e0] bg-white px-2.5 py-1.5 text-xs font-semibold text-[#445248] transition hover:bg-[#f6f8f5]"
-                                    onClick={() => openModal("customer-details", customer)}
-                                  >
-                                    <Eye size={13} />
-                                    Details
-                                  </button>
-                                  <button
-                                    type="button"
-                                    title="Edit customer details"
-                                    className="rounded-lg p-1.5 text-[#6c7870] transition hover:bg-[#edf2eb] hover:text-[#285d42]"
-                                    onClick={() => openModal("edit-customer", customer)}
-                                  >
-                                    <Edit size={14} />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="rounded-lg bg-[#edf4ed] px-2.5 py-1.5 text-xs font-semibold text-[#285d42] transition hover:bg-[#e2ede2] disabled:cursor-not-allowed disabled:opacity-40"
-                                    disabled={
-                                      customer.pending_balance == null ||
-                                      customer.pending_balance <= 0
+                              <td
+                                className="px-5 py-4 text-right"
+                                onClick={(event) => event.stopPropagation()}
+                              >
+                                <div className="flex justify-end">
+                                  <CustomerActionsMenu
+                                    customer={customer}
+                                    onDetails={() => openCustomerPage(customer)}
+                                    onReceive={() =>
+                                      openModal("payment", customer)
                                     }
-                                    onClick={() => openModal("payment", customer)}
-                                  >
-                                    Receive
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e] transition hover:bg-[#eef4ee]"
-                                    onClick={() => openModal("ledger", customer)}
-                                  >
-                                    <BookOpen size={14} /> Ledger
-                                  </button>
-                                  <WhatsAppReminder customer={customer} />
+                                    onLedger={() => openModal("ledger", customer)}
+                                    onEdit={() =>
+                                      openModal("edit-customer", customer)
+                                    }
+                                  />
                                 </div>
                               </td>
                             </tr>
@@ -1118,7 +1217,11 @@ export default function Home() {
                         customer.pending_balance === 0;
 
                       return (
-                        <div key={customer.id} className="p-4 sm:p-5">
+                        <div
+                          key={customer.id}
+                          onClick={() => openCustomerPage(customer)}
+                          className="cursor-pointer p-4 transition hover:bg-[#fafbf9] sm:p-5"
+                        >
                           <div className="flex items-start justify-between gap-3">
                             <div className="flex items-start gap-3">
                               <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#edf3ec] text-sm font-semibold text-[#52755a]">
@@ -1144,7 +1247,10 @@ export default function Home() {
                                 </div>
                               </div>
                             </div>
-                            <div>
+                            <div
+                              className="flex items-center gap-1.5"
+                              onClick={(event) => event.stopPropagation()}
+                            >
                               {hasDue ? (
                                 <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700">
                                   Due
@@ -1158,6 +1264,16 @@ export default function Home() {
                                   No Sales
                                 </span>
                               )}
+                              <CustomerActionsMenu
+                                customer={customer}
+                                triggerClassName="h-9 w-9 border border-[#e6eae3] bg-white shadow-sm"
+                                onDetails={() => openCustomerPage(customer)}
+                                onReceive={() => openModal("payment", customer)}
+                                onLedger={() => openModal("ledger", customer)}
+                                onEdit={() =>
+                                  openModal("edit-customer", customer)
+                                }
+                              />
                             </div>
                           </div>
 
@@ -1188,48 +1304,6 @@ export default function Home() {
                               </span>
                             </div>
                           </div>
-
-                          {/* Mobile Actions Bar */}
-                          <div className="mt-3 flex flex-wrap items-center justify-between gap-1.5 border-t border-[#f2f4ef] pt-3">
-                            <div className="flex items-center gap-1">
-                              <button
-                                type="button"
-                                className="flex items-center gap-1 rounded-lg border border-[#e2e7e0] bg-white px-2.5 py-1.5 text-xs font-semibold text-[#445248]"
-                                onClick={() => openModal("customer-details", customer)}
-                              >
-                                <Eye size={13} /> Details
-                              </button>
-                              <button
-                                type="button"
-                                className="rounded-lg p-1.5 text-[#6c7870] hover:bg-[#edf2eb]"
-                                onClick={() => openModal("edit-customer", customer)}
-                                title="Edit profile"
-                              >
-                                <Edit size={14} />
-                              </button>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                className="rounded-lg bg-[#edf4ed] px-2.5 py-1.5 text-xs font-semibold text-[#285d42] disabled:opacity-40"
-                                disabled={
-                                  customer.pending_balance == null ||
-                                  customer.pending_balance <= 0
-                                }
-                                onClick={() => openModal("payment", customer)}
-                              >
-                                Receive
-                              </button>
-                              <button
-                                type="button"
-                                className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-[#56755e]"
-                                onClick={() => openModal("ledger", customer)}
-                              >
-                                <BookOpen size={13} /> Ledger
-                              </button>
-                              <WhatsAppReminder customer={customer} />
-                            </div>
-                          </div>
                         </div>
                       );
                     })}
@@ -1252,6 +1326,16 @@ export default function Home() {
           </section>
         )}
 
+          {activeTab === "stock" && (
+            <StockPage
+              data={stock}
+              loading={stockLoading}
+              error={stockError}
+              onAddStock={() => openModal("stock")}
+              onRetry={() => void refreshStock()}
+            />
+          )}
+
           {activeTab === "sales" && (
             <div className="mt-8 space-y-6">
               <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[#e8ece5] bg-white p-5 shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
@@ -1260,7 +1344,8 @@ export default function Home() {
                     Sales Management
                   </h3>
                   <p className="mt-1 text-xs text-[#838c85]">
-                    Daily packet sales, 14-day trends, and chronological transaction records.
+                    Chronological packet sales with billed totals, payments, and
+                    balances.
                   </p>
                 </div>
                 <button
@@ -1274,18 +1359,11 @@ export default function Home() {
               </div>
 
               {dashboardData?.salesAvailable && !dataStale ? (
-                <section className="grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,0.8fr)]">
-                  <SalesTrend
-                    businessDate={businessDate}
-                    dailyTotals={dashboardData.dailyTotals}
-                    available={dashboardData.salesComplete}
-                  />
-                  <RecentSales
-                    sales={dashboardData.recentSales}
-                    customers={customers}
-                    complete={dashboardData.salesComplete}
-                  />
-                </section>
+                <RecentSales
+                  sales={dashboardData.recentSales}
+                  customers={customers}
+                  complete={dashboardData.salesComplete}
+                />
               ) : (
                 <div className="rounded-2xl border border-dashed border-[#e2e6df] bg-white p-8 text-center text-sm text-[#7b847e]">
                   {dataLoading
@@ -1294,6 +1372,9 @@ export default function Home() {
                 </div>
               )}
             </div>
+          )}
+
+            </>
           )}
 
           <footer className="mt-8 flex flex-col gap-2 border-t border-[#e7eae4] pt-5 text-xs text-[#929a93] sm:flex-row sm:items-center sm:justify-between">
@@ -1441,6 +1522,15 @@ export default function Home() {
               onReceivePayment={() => openModal("payment", selectedCustomer)}
             />
           )}
+
+          {modal === "stock" && (
+            <StockForm
+              saving={saving}
+              error={formError}
+              onSubmit={handleAddStock}
+              onCancel={closeModal}
+            />
+          )}
         </Modal>
       )}
     </div>
@@ -1546,7 +1636,7 @@ function CustomerDetailsView({
           </button>
         </div>
 
-        {/* Khata Financial Summary */}
+        {/* Financial Summary */}
         <div className="mt-4 grid grid-cols-3 gap-2 border-t border-[#e2e7e0] pt-3 text-center sm:gap-3">
           <div className="rounded-xl bg-white p-2.5 shadow-sm">
             <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#79857c]">
@@ -1693,6 +1783,942 @@ function CustomerDetailsView({
   );
 }
 
+const STOCK_UNIT_META: Record<
+  StockUnit,
+  { label: string; shortLabel: string; unitLabel: string; isBulk: boolean }
+> = {
+  "500g": {
+    label: "500g packets",
+    shortLabel: "500g",
+    unitLabel: "packets",
+    isBulk: false,
+  },
+  "1kg": {
+    label: "1kg packets",
+    shortLabel: "1kg",
+    unitLabel: "packets",
+    isBulk: false,
+  },
+  bulk: {
+    label: "Bulk sugar",
+    shortLabel: "Bulk",
+    unitLabel: "kg",
+    isBulk: true,
+  },
+};
+
+const STOCK_UNIT_ORDER: StockUnit[] = ["500g", "1kg", "bulk"];
+
+function formatStockQty(value: number, isBulk: boolean) {
+  return new Intl.NumberFormat("en-IN", {
+    maximumFractionDigits: isBulk ? 3 : 0,
+  }).format(value);
+}
+
+function StockStat({
+  label,
+  value,
+  detail,
+  icon,
+  tone,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  icon: React.ReactNode;
+  tone: "green" | "amber" | "red" | "neutral";
+}) {
+  const tones = {
+    green: "bg-[#eef4ee] text-[#52755a]",
+    amber: "bg-amber-50 text-amber-700",
+    red: "bg-red-50 text-red-600",
+    neutral: "bg-[#f2f4ef] text-[#6d7970]",
+  };
+
+  return (
+    <div className="rounded-2xl border border-[#e8ece5] bg-white p-4 shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#87928a]">
+          {label}
+        </span>
+        <span
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${tones[tone]}`}
+        >
+          {icon}
+        </span>
+      </div>
+      <p className="mt-2.5 text-xl font-bold tracking-[-0.03em] text-[#25372c]">
+        {value}
+      </p>
+      <p className="mt-1 text-[11px] leading-4 text-[#939c95]">{detail}</p>
+    </div>
+  );
+}
+
+function StockPage({
+  data,
+  loading,
+  error,
+  onAddStock,
+  onRetry,
+}: {
+  data: StockOverview | null;
+  loading: boolean;
+  error: string;
+  onAddStock: () => void;
+  onRetry: () => void;
+}) {
+  if (!data && loading) {
+    return (
+      <div className="mt-8 flex items-center justify-center gap-2 rounded-2xl border border-[#e9ebe6] bg-white py-16 text-sm text-[#7c867e]">
+        <LoaderCircle size={18} className="animate-spin" />
+        Loading stock details…
+      </div>
+    );
+  }
+
+  const units = data?.units;
+  const lastEntry = data?.lastEntry ?? null;
+  const packetsInHand = data?.packetsInHand ?? 0;
+  const lowStock = packetsInHand <= 0;
+
+  return (
+    <section className="mt-8 space-y-5">
+      <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+        <div>
+          <div className="flex items-center gap-2">
+            <h3 className="text-lg font-semibold tracking-[-0.025em]">
+              Packet Stock
+            </h3>
+            {data && (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                  lowStock
+                    ? "bg-red-50 text-red-700"
+                    : "bg-[#e9eee8] text-[#607165]"
+                }`}
+              >
+                {lowStock ? "Stock empty" : "In stock"}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 text-sm text-[#838c85]">
+            Stock added, packets sold, and what is left in hand.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className={secondaryButton}
+            onClick={onRetry}
+            disabled={loading}
+          >
+            <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
+            Refresh
+          </button>
+          <button
+            type="button"
+            className={primaryButton}
+            onClick={onAddStock}
+            disabled={data ? !data.available : false}
+          >
+            <PackagePlus size={16} />
+            Add Stock
+          </button>
+        </div>
+      </div>
+
+      <FormError message={error} />
+
+      {data && !data.available && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3.5 text-sm leading-6 text-amber-900">
+          <p className="font-semibold">Stock tracking is not set up yet</p>
+          <p className="mt-0.5 text-xs leading-5 text-amber-800">
+            Apply{" "}
+            <code className="rounded bg-amber-100 px-1 py-0.5">
+              supabase/migrations/20261023000000_stock_entries.sql
+            </code>{" "}
+            in your Supabase project, then press Refresh.
+          </p>
+        </div>
+      )}
+
+      {data?.warning && data.available && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900">
+          {data.warning}
+        </div>
+      )}
+
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StockStat
+          label="Packets In Hand"
+          value={`${formatStockQty(packetsInHand, false)} packets`}
+          detail={
+            units
+              ? `500g: ${formatStockQty(units["500g"].remaining, false)} · 1kg: ${formatStockQty(units["1kg"].remaining, false)} · Bulk: ${formatStockQty(units.bulk.remaining, true)} kg`
+              : "Unavailable"
+          }
+          icon={<Boxes size={16} />}
+          tone={lowStock ? "red" : "green"}
+        />
+        <StockStat
+          label="Total Stocked"
+          value={`${formatStockQty(data?.totalStockedPackets ?? 0, false)} packets`}
+          detail="All-time packets added to stock"
+          icon={<PackagePlus size={16} />}
+          tone="amber"
+        />
+        <StockStat
+          label="Total Sold"
+          value={`${formatStockQty(data?.totalSoldPackets ?? 0, false)} packets`}
+          detail="Packets sold since stock tracking started"
+          icon={<ShoppingBag size={16} />}
+          tone="neutral"
+        />
+        <StockStat
+          label="Last Stock Update"
+          value={lastEntry ? formatDate(lastEntry.added_on) : "—"}
+          detail={
+            lastEntry
+              ? `${formatStockQty(
+                  Number(lastEntry.quantity),
+                  lastEntry.stock_unit === "bulk",
+                )} ${STOCK_UNIT_META[lastEntry.stock_unit].unitLabel} added`
+              : "No stock update yet"
+          }
+          icon={<Calendar size={16} />}
+          tone="neutral"
+        />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        {STOCK_UNIT_ORDER.map((unit) => {
+          const meta = STOCK_UNIT_META[unit];
+          const summary = units?.[unit];
+          const added = summary?.added ?? 0;
+          const sold = summary?.sold ?? 0;
+          const remaining = summary?.remaining ?? 0;
+          const lastUnitEntry = summary?.lastEntry ?? null;
+          const soldSince = summary?.soldSinceLastEntry ?? 0;
+          const soldPercent =
+            added > 0
+              ? Math.min(100, Math.max(0, Math.round((sold / added) * 100)))
+              : 0;
+          const empty = remaining <= 0;
+
+          return (
+            <div
+              key={unit}
+              className="rounded-2xl border border-[#e8ece5] bg-white p-5 shadow-[0_2px_8px_rgba(24,40,30,0.03)]"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-sm font-semibold text-[#29382e]">
+                    {meta.label}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-[#8e9891]">
+                    {lastUnitEntry
+                      ? `Last updated ${formatDate(lastUnitEntry.added_on)}`
+                      : "No stock added yet"}
+                  </p>
+                </div>
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                    empty
+                      ? "bg-red-50 text-red-700"
+                      : "bg-emerald-50 text-emerald-800"
+                  }`}
+                >
+                  {empty ? "Empty" : "Available"}
+                </span>
+              </div>
+
+              <div className="mt-4 flex items-end gap-1.5">
+                <span
+                  className={`text-3xl font-bold tracking-[-0.04em] ${
+                    empty ? "text-red-600" : "text-[#25372c]"
+                  }`}
+                >
+                  {formatStockQty(remaining, meta.isBulk)}
+                </span>
+                <span className="pb-1 text-xs font-medium text-[#87928a]">
+                  {meta.unitLabel} left
+                </span>
+              </div>
+
+              <div className="mt-3">
+                <div className="flex items-center justify-between text-[10px] font-medium text-[#8b958d]">
+                  <span>Sold {formatStockQty(sold, meta.isBulk)}</span>
+                  <span>{soldPercent}% of stock</span>
+                </div>
+                <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-[#edf1ea]">
+                  <div
+                    className={`h-full rounded-full ${
+                      soldPercent >= 100
+                        ? "bg-red-500"
+                        : soldPercent >= 75
+                          ? "bg-amber-500"
+                          : "bg-[#5d8f6b]"
+                    }`}
+                    style={{ width: `${soldPercent}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-2 gap-2 border-t border-[#eef0eb] pt-3 text-xs">
+                <div>
+                  <span className="block text-[10px] uppercase tracking-wider text-[#99a29b]">
+                    Total stocked
+                  </span>
+                  <span className="mt-0.5 block font-semibold text-[#405046]">
+                    {formatStockQty(added, meta.isBulk)} {meta.unitLabel}
+                  </span>
+                </div>
+                <div>
+                  <span className="block text-[10px] uppercase tracking-wider text-[#99a29b]">
+                    Sold since tracking
+                  </span>
+                  <span className="mt-0.5 block font-semibold text-[#405046]">
+                    {formatStockQty(sold, meta.isBulk)} {meta.unitLabel}
+                  </span>
+                </div>
+              </div>
+
+              <p className="mt-3 rounded-lg bg-[#f7faf5] px-2.5 py-2 text-[11px] leading-4 text-[#6f7d72]">
+                {lastUnitEntry
+                  ? `Since last update: ${formatStockQty(
+                      Number(lastUnitEntry.quantity),
+                      meta.isBulk,
+                    )} ${meta.unitLabel} added and ${formatStockQty(
+                      soldSince,
+                      meta.isBulk,
+                    )} ${meta.unitLabel} sold.`
+                  : "Add a stock entry to start tracking this packet size."}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="overflow-hidden rounded-2xl border border-[#e9ebe6] bg-white">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eef0eb] px-5 py-4">
+          <div>
+            <h3 className="text-sm font-semibold tracking-[-0.02em] text-[#29382e]">
+              Stock Update History
+            </h3>
+            <p className="mt-0.5 text-xs text-[#8d968e]">
+              Every stock addition, with sales since that update.
+            </p>
+          </div>
+          <span className="rounded-full bg-[#edf2eb] px-2.5 py-1 text-[11px] font-semibold text-[#52685a]">
+            {data?.entries.length ?? 0} updates
+          </span>
+        </div>
+
+        {!data || data.entries.length === 0 ? (
+          <div className="px-5 py-12 text-center">
+            <PackagePlus className="mx-auto text-[#8ca18d]" size={24} />
+            <p className="mt-2 text-sm font-semibold text-[#405046]">
+              No stock updates yet
+            </p>
+            <p className="mt-1 text-xs text-[#8a938c]">
+              Add your first stock entry to start tracking packets in hand.
+            </p>
+            <button
+              type="button"
+              className={`${primaryButton} mt-4`}
+              onClick={onAddStock}
+              disabled={data ? !data.available : false}
+            >
+              <PackagePlus size={16} />
+              Add Stock
+            </button>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[680px] text-left text-xs">
+              <thead className="border-b border-[#eef0eb] bg-[#fbfcfa] text-[10px] font-semibold uppercase tracking-[0.1em] text-[#919a92]">
+                <tr>
+                  <th className="px-5 py-2.5">Date</th>
+                  <th className="px-4 py-2.5">Packet size</th>
+                  <th className="px-4 py-2.5 text-right">Stock added</th>
+                  <th className="px-4 py-2.5 text-right">Sold since</th>
+                  <th className="px-4 py-2.5">Note</th>
+                  <th className="px-5 py-2.5 text-right">Updated</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#eef0eb]">
+                {data.entries.slice(0, 25).map((entry) => {
+                  const meta = STOCK_UNIT_META[entry.stock_unit];
+                  const soldSince = data.soldSinceByEntry[entry.id] ?? 0;
+                  return (
+                    <tr key={entry.id} className="hover:bg-[#fafbf9]">
+                      <td className="whitespace-nowrap px-5 py-3 font-medium text-[#657368]">
+                        {formatDate(entry.added_on)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="rounded-full bg-[#eef2eb] px-2 py-0.5 text-[10px] font-semibold text-[#5f6f64]">
+                          {meta.shortLabel}
+                        </span>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-right font-semibold text-[#2f3f33]">
+                        +{formatStockQty(Number(entry.quantity), meta.isBulk)}{" "}
+                        {meta.unitLabel}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-right text-[#59685d]">
+                        {formatStockQty(soldSince, meta.isBulk)}{" "}
+                        {meta.unitLabel}
+                      </td>
+                      <td className="max-w-[220px] truncate px-4 py-3 text-[#7c877f]">
+                        {entry.note || "—"}
+                      </td>
+                      <td className="whitespace-nowrap px-5 py-3 text-right text-[11px] text-[#98a19a]">
+                        {new Intl.DateTimeFormat("en-IN", {
+                          day: "2-digit",
+                          month: "short",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        }).format(new Date(entry.created_at))}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div className="border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-[11px] leading-5 text-[#8d968e]">
+          Sold quantities come from recorded sales. Current stock = total stock
+          added − quantity sold since tracking started.
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function StockForm({
+  saving,
+  error,
+  onSubmit,
+  onCancel,
+}: {
+  saving: boolean;
+  error: string;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCancel: () => void;
+}) {
+  const [stockUnit, setStockUnit] = useState<StockUnit>("500g");
+  const isBulk = stockUnit === "bulk";
+
+  return (
+    <form onSubmit={onSubmit} className="space-y-4">
+      <Field label="Packet size" required>
+        <select
+          className={inputClass}
+          name="stockUnit"
+          value={stockUnit}
+          onChange={(event) => setStockUnit(event.target.value as StockUnit)}
+          required
+        >
+          <option value="500g">500g packets</option>
+          <option value="1kg">1kg packets</option>
+          <option value="bulk">Bulk sugar (kg)</option>
+        </select>
+      </Field>
+      <Field label={isBulk ? "Quantity (kg)" : "Number of packets"} required>
+        <input
+          className={inputClass}
+          name="quantity"
+          type="number"
+          inputMode="decimal"
+          min={isBulk ? "0.001" : "1"}
+          step={isBulk ? "0.001" : "1"}
+          required
+          placeholder={isBulk ? "e.g. 50" : "e.g. 200"}
+        />
+      </Field>
+      <Field label="Stock added on" required>
+        <input
+          className={inputClass}
+          name="addedOn"
+          type="date"
+          defaultValue={today()}
+          max={today()}
+          required
+        />
+      </Field>
+      <Field label="Note">
+        <input
+          className={inputClass}
+          name="note"
+          maxLength={240}
+          placeholder="e.g. Weekly stock from supplier"
+        />
+      </Field>
+      <FormError message={error} />
+      <ModalActions
+        onCancel={onCancel}
+        saving={saving}
+        submitLabel="Save stock"
+      />
+    </form>
+  );
+}
+
+function CustomerProfilePage({
+  customer,
+  entries,
+  loading,
+  error,
+  notice,
+  onDismissNotice,
+  onBack,
+  onReceivePayment,
+  onEditCustomer,
+}: {
+  customer: Customer;
+  entries: LedgerEntry[];
+  loading: boolean;
+  error: string;
+  notice: string;
+  onDismissNotice: () => void;
+  onBack: () => void;
+  onReceivePayment: () => void;
+  onEditCustomer: () => void;
+}) {
+  const hasDue =
+    customer.pending_balance !== null && customer.pending_balance > 0;
+  const isSettled =
+    customer.total_billed !== null &&
+    customer.total_billed > 0 &&
+    customer.pending_balance === 0;
+  const whatsappHref = getWhatsAppUrl(customer);
+  const salesCount = entries.filter((entry) => entry.kind === "sale").length;
+  const paymentCount = entries.filter((entry) => entry.kind === "payment").length;
+  const lastPurchase = entries.find((entry) => entry.kind === "sale");
+  const lastPayment = entries.find((entry) => entry.kind === "payment");
+  const paidPercent =
+    customer.total_billed !== null &&
+    customer.total_billed > 0 &&
+    customer.total_paid !== null
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            Math.round((customer.total_paid / customer.total_billed) * 100),
+          ),
+        )
+      : null;
+
+  const history = useMemo(() => {
+    const ascending = [...entries].sort(
+      (left, right) =>
+        left.date.localeCompare(right.date) ||
+        left.created_at.localeCompare(right.created_at),
+    );
+    let running = 0;
+    const rows = ascending.map((entry) => {
+      running += entry.debit - entry.credit;
+      return { entry, running };
+    });
+    return rows.reverse();
+  }, [entries]);
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={onBack}
+        className="inline-flex items-center gap-1.5 rounded-lg py-1 pr-2 text-sm font-semibold text-[#6d7970] transition hover:text-[#285d42]"
+      >
+        <ArrowLeft size={16} />
+        Back to customers
+      </button>
+
+      <section className="mt-4 overflow-hidden rounded-2xl border border-[#e8ece5] bg-white shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
+        <div className="flex flex-col gap-4 border-b border-[#eef0eb] bg-[#f8faf7] p-5 sm:flex-row sm:items-start sm:justify-between sm:p-6">
+          <div className="flex items-start gap-4">
+            <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-[#285d42] text-xl font-bold text-white shadow-sm">
+              {customer.name.trim().charAt(0).toUpperCase()}
+            </span>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-xl font-semibold tracking-[-0.03em] text-[#25372c] sm:text-2xl">
+                  {customer.name}
+                </h2>
+                {hasDue ? (
+                  <span className="rounded-md bg-red-100 px-2 py-0.5 text-[11px] font-semibold text-red-700">
+                    Due Pending
+                  </span>
+                ) : isSettled ? (
+                  <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
+                    Fully Paid
+                  </span>
+                ) : (
+                  <span className="rounded-md bg-[#edf0eb] px-2 py-0.5 text-[11px] font-medium text-[#647167]">
+                    No Sales
+                  </span>
+                )}
+              </div>
+              <div className="mt-2 flex flex-col gap-1 text-xs text-[#606d63] sm:flex-row sm:flex-wrap sm:gap-x-4">
+                <span className="flex items-center gap-1.5">
+                  <Phone size={13} className="text-[#89978c]" />
+                  {customer.phone || (
+                    <span className="italic text-[#9aa49d]">No phone</span>
+                  )}
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <MapPin size={13} className="text-[#89978c]" />
+                  {customer.address || (
+                    <span className="italic text-[#9aa49d]">No area</span>
+                  )}
+                </span>
+                <span className="flex items-center gap-1.5 text-[11px] text-[#8e9891]">
+                  <Calendar size={13} className="text-[#a0aaa2]" />
+                  Customer since {formatDate(customer.created_at)}
+                </span>
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onEditCustomer}
+            className={`${secondaryButton} !h-9 !px-3 text-xs`}
+          >
+            <Edit size={13} />
+            Edit Profile
+          </button>
+        </div>
+
+        <div className="grid gap-3 p-5 sm:grid-cols-3 sm:p-6">
+          <div className="rounded-xl border border-[#eef0eb] bg-[#fbfcfa] p-4">
+            <span className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#87928a]">
+              <Package size={13} />
+              Total Billed
+            </span>
+            <p className="mt-2 text-xl font-bold tracking-[-0.03em] text-[#25372c] sm:text-2xl">
+              {formatOptionalMoney(customer.total_billed)}
+            </p>
+            <p className="mt-1 text-[11px] text-[#939c95]">
+              வாங்கியது · {salesCount} sales
+            </p>
+          </div>
+          <div className="rounded-xl border border-[#e3ede3] bg-[#f6faf5] p-4">
+            <span className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#6f8a76]">
+              <Banknote size={13} />
+              Total Paid
+            </span>
+            <p className="mt-2 text-xl font-bold tracking-[-0.03em] text-[#285d42] sm:text-2xl">
+              {formatOptionalMoney(customer.total_paid)}
+            </p>
+            <p className="mt-1 text-[11px] text-[#7d9483]">
+              செலுத்தியது · {paymentCount} due payments
+            </p>
+          </div>
+          <div
+            className={`rounded-xl border p-4 ${
+              hasDue
+                ? "border-[#f3d9d4] bg-[#fff7f4]"
+                : "border-[#e3ede3] bg-[#f6faf5]"
+            }`}
+          >
+            <span
+              className={`flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] ${
+                hasDue ? "text-[#b46656]" : "text-[#6f8a76]"
+              }`}
+            >
+              <IndianRupee size={13} />
+              Balance Due
+            </span>
+            <p
+              className={`mt-2 text-xl font-bold tracking-[-0.03em] sm:text-2xl ${
+                hasDue ? "text-red-600" : "text-emerald-700"
+              }`}
+            >
+              {formatOptionalMoney(customer.pending_balance)}
+            </p>
+            <p
+              className={`mt-1 text-[11px] ${
+                hasDue ? "text-[#bd8074]" : "text-[#7d9483]"
+              }`}
+            >
+              {hasDue ? "இன்னும் செலுத்த வேண்டியது" : "All dues cleared"}
+            </p>
+          </div>
+        </div>
+
+        {paidPercent !== null && (
+          <div className="px-5 pb-4 sm:px-6">
+            <div className="flex items-center justify-between text-[11px] font-medium text-[#7c877f]">
+              <span>Payment progress</span>
+              <span>{paidPercent}% paid</span>
+            </div>
+            <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-[#edf1ea]">
+              <div
+                className={`h-full rounded-full ${
+                  hasDue ? "bg-[#5d8f6b]" : "bg-emerald-600"
+                }`}
+                style={{ width: `${paidPercent}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3 border-t border-[#eef0eb] px-5 py-4 text-xs sm:grid-cols-4 sm:px-6">
+          <div>
+            <span className="block text-[10px] uppercase tracking-wider text-[#99a29b]">
+              Last purchase
+            </span>
+            <span className="mt-1 block font-semibold text-[#405046]">
+              {lastPurchase ? formatDate(lastPurchase.date) : "—"}
+            </span>
+          </div>
+          <div>
+            <span className="block text-[10px] uppercase tracking-wider text-[#99a29b]">
+              Last payment
+            </span>
+            <span className="mt-1 block font-semibold text-[#405046]">
+              {lastPayment ? formatDate(lastPayment.date) : "—"}
+            </span>
+          </div>
+          <div>
+            <span className="block text-[10px] uppercase tracking-wider text-[#99a29b]">
+              Transactions
+            </span>
+            <span className="mt-1 block font-semibold text-[#405046]">
+              {entries.length}
+            </span>
+          </div>
+          <div>
+            <span className="block text-[10px] uppercase tracking-wider text-[#99a29b]">
+              Phone
+            </span>
+            <span className="mt-1 block font-semibold text-[#405046]">
+              {customer.phone || "—"}
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          className={primaryButton}
+          disabled={
+            customer.pending_balance === null || customer.pending_balance <= 0
+          }
+          onClick={onReceivePayment}
+        >
+          <Banknote size={16} />
+          Receive Due Payment
+        </button>
+        {whatsappHref ? (
+          <a
+            className={`${secondaryButton} text-[#28734b]`}
+            href={whatsappHref}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <MessageCircle size={16} />
+            WhatsApp Reminder
+          </a>
+        ) : (
+          <button
+            type="button"
+            className={secondaryButton}
+            disabled
+            title="A valid phone number and balance are required to send a WhatsApp reminder."
+          >
+            <MessageCircle size={16} />
+            WhatsApp Unavailable
+          </button>
+        )}
+      </div>
+
+      {notice && (
+        <div className="mt-4 flex items-center justify-between rounded-xl border border-[#dceade] bg-[#f0f7f0] px-4 py-3 text-sm text-[#356347]">
+          <span className="flex items-center gap-2">
+            <Check size={17} />
+            {notice}
+          </span>
+          <button type="button" aria-label="Dismiss notification" onClick={onDismissNotice}>
+            <X size={17} />
+          </button>
+        </div>
+      )}
+
+      {error && <FormError message={error} />}
+
+      <section className="mt-5 overflow-hidden rounded-2xl border border-[#e9ebe6] bg-white">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eef0eb] px-5 py-4">
+          <div>
+            <h3 className="text-sm font-semibold tracking-[-0.02em] text-[#29382e]">
+              Transaction History
+            </h3>
+            <p className="mt-0.5 text-xs text-[#8d968e]">
+              {salesCount} {salesCount === 1 ? "sale" : "sales"} ·{" "}
+              {paymentCount} {paymentCount === 1 ? "payment" : "payments"}
+            </p>
+          </div>
+          <span className="rounded-full bg-[#edf2eb] px-2.5 py-1 text-[11px] font-semibold text-[#52685a]">
+            {entries.length} {entries.length === 1 ? "entry" : "entries"}
+          </span>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 px-5 py-12 text-sm text-[#7c867e]">
+            <LoaderCircle size={17} className="animate-spin" />
+            Loading transaction history…
+          </div>
+        ) : history.length === 0 ? (
+          <div className="px-5 py-12 text-center">
+            <ShoppingBag className="mx-auto text-[#8ca18d]" size={24} />
+            <p className="mt-2 text-sm font-semibold text-[#405046]">
+              No transactions recorded yet
+            </p>
+            <p className="mt-1 text-xs text-[#8a938c]">
+              Sales and payments for {customer.name} will appear here.
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="hidden overflow-x-auto md:block">
+              <table className="w-full min-w-[640px] text-left text-xs">
+                <thead className="border-b border-[#eef0eb] bg-[#fbfcfa] text-[10px] font-semibold uppercase tracking-[0.1em] text-[#919a92]">
+                  <tr>
+                    <th className="px-5 py-2.5">Date</th>
+                    <th className="px-4 py-2.5">Type &amp; Description</th>
+                    <th className="px-4 py-2.5 text-right">Billed</th>
+                    <th className="px-4 py-2.5 text-right">Paid</th>
+                    <th className="px-5 py-2.5 text-right">Balance</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#eef0eb]">
+                  {history.map(({ entry, running }) => (
+                    <tr
+                      key={`${entry.kind}-${entry.id}`}
+                      className="hover:bg-[#fafbf9]"
+                    >
+                      <td className="whitespace-nowrap px-5 py-3 font-medium text-[#657368]">
+                        {formatDate(entry.date)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
+                              entry.kind === "sale"
+                                ? "bg-amber-50 text-amber-700"
+                                : "bg-emerald-50 text-emerald-700"
+                            }`}
+                          >
+                            {entry.kind === "sale" ? "Sale" : "Payment"}
+                          </span>
+                          <span className="font-semibold text-[#2f3f33]">
+                            {entry.description}
+                          </span>
+                        </div>
+                        {entry.kind === "sale" && (
+                          <span className="mt-0.5 block text-[10px] text-[#88948a]">
+                            {entry.sale_unit === "bulk"
+                              ? `${entry.sale_quantity} kg @ ${formatMoney(entry.rate_per_unit)}`
+                              : `${entry.sale_quantity} × ${entry.sale_unit} @ ${formatMoney(entry.rate_per_unit)}`}
+                          </span>
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-right text-[#4d5c50]">
+                        {entry.debit ? formatMoney(entry.debit) : "—"}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-right font-medium text-[#285d42]">
+                        {entry.credit ? formatMoney(entry.credit) : "—"}
+                      </td>
+                      <td className="whitespace-nowrap px-5 py-3 text-right font-semibold text-[#48564c]">
+                        {formatMoney(running)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="border-t border-[#e5e9e2] bg-[#f8faf7]">
+                  <tr className="text-xs font-semibold text-[#405046]">
+                    <td className="px-5 py-3" colSpan={2}>
+                      Totals
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {formatOptionalMoney(customer.total_billed)}
+                    </td>
+                    <td className="px-4 py-3 text-right text-[#285d42]">
+                      {formatOptionalMoney(customer.total_paid)}
+                    </td>
+                    <td
+                      className={`px-5 py-3 text-right ${
+                        hasDue ? "text-red-600" : "text-emerald-700"
+                      }`}
+                    >
+                      {formatOptionalMoney(customer.pending_balance)}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+
+            <ul className="divide-y divide-[#eef0eb] md:hidden">
+              {history.map(({ entry, running }) => (
+                <li
+                  key={`${entry.kind}-${entry.id}`}
+                  className="px-4 py-3.5"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide ${
+                            entry.kind === "sale"
+                              ? "bg-amber-50 text-amber-700"
+                              : "bg-emerald-50 text-emerald-700"
+                          }`}
+                        >
+                          {entry.kind === "sale" ? "Sale" : "Payment"}
+                        </span>
+                        <span className="text-[11px] font-medium text-[#87928a]">
+                          {formatDate(entry.date)}
+                        </span>
+                      </div>
+                      <p className="mt-1 truncate text-sm font-semibold text-[#2f3f33]">
+                        {entry.description}
+                      </p>
+                      {entry.kind === "sale" && (
+                        <p className="mt-0.5 text-[11px] text-[#88948a]">
+                          {entry.sale_unit === "bulk"
+                            ? `${entry.sale_quantity} kg @ ${formatMoney(entry.rate_per_unit)}`
+                            : `${entry.sale_quantity} × ${entry.sale_unit} @ ${formatMoney(entry.rate_per_unit)}`}
+                        </p>
+                      )}
+                    </div>
+                    <div className="shrink-0 text-right">
+                      {entry.debit > 0 && (
+                        <p className="text-sm font-semibold text-[#3c4a3f]">
+                          {formatMoney(entry.debit)}
+                        </p>
+                      )}
+                      {entry.credit > 0 && (
+                        <p className="text-sm font-semibold text-[#285d42]">
+                          −{formatMoney(entry.credit)}
+                        </p>
+                      )}
+                      <p className="mt-0.5 text-[10px] text-[#98a19a]">
+                        Bal. {formatMoney(running)}
+                      </p>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
 const inputClass =
   "mt-1.5 h-11 w-full rounded-xl border border-[#e4e8e1] bg-white px-3.5 text-sm text-[#25372c] outline-none placeholder:text-[#a0a79f] focus:border-[#8eae94] focus:ring-2 focus:ring-[#e7f0e7]";
 
@@ -1720,7 +2746,7 @@ function BrandMark() {
   );
 }
 
-function WhatsAppReminder({ customer }: { customer: Customer }) {
+function getWhatsAppUrl(customer: Customer) {
   const digits = (customer.phone ?? "").replace(/\D/g, "");
   const phone =
     digits.length === 10
@@ -1728,34 +2754,248 @@ function WhatsAppReminder({ customer }: { customer: Customer }) {
       : digits.length === 12 && digits.startsWith("91")
         ? digits
         : null;
+  if (!phone || customer.pending_balance === null) return null;
   const message = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatOptionalMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
+  return `https://wa.me/${phone}?text=${encodeURIComponent(message)}`;
+}
 
-  if (!phone || customer.pending_balance === null) {
-    return (
-      <button
-        type="button"
-        className="rounded-lg px-2 py-1.5 text-xs font-semibold text-[#a0a79f]"
-        disabled
-        title={
-          customer.pending_balance === null
-            ? "The current balance is unavailable."
-            : "A valid 10-digit phone number is required for WhatsApp."
-        }
-      >
-        WhatsApp
-      </button>
+const menuItemClass =
+  "flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium text-[#3f4f44] transition hover:bg-[#f4f8f2] focus:bg-[#f4f8f2] focus:outline-none disabled:cursor-not-allowed disabled:text-[#a5ada7] disabled:hover:bg-transparent";
+
+function CustomerActionsMenu({
+  customer,
+  onDetails,
+  onReceive,
+  onLedger,
+  onEdit,
+  triggerClassName = "",
+}: {
+  customer: Customer;
+  onDetails: () => void;
+  onReceive: () => void;
+  onLedger: () => void;
+  onEdit: () => void;
+  triggerClassName?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<{
+    top?: number;
+    bottom?: number;
+    right: number;
+    maxHeight: number;
+  } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const close = useCallback((refocus = false) => {
+    setOpen(false);
+    setPosition(null);
+    if (refocus) triggerRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  const toggle = () => {
+    if (open) {
+      close();
+      return;
+    }
+
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const width = 224;
+    const estimatedHeight = 268;
+    const spaceBelow = window.innerHeight - rect.bottom;
+
+    const right = Math.max(
+      8,
+      Math.min(
+        window.innerWidth - rect.right,
+        Math.max(8, window.innerWidth - width - 8),
+      ),
     );
-  }
+
+    if (spaceBelow < estimatedHeight && rect.top > spaceBelow) {
+      const bottom = window.innerHeight - rect.top + 6;
+      setPosition({
+        bottom,
+        right,
+        maxHeight: Math.max(180, window.innerHeight - bottom - 12),
+      });
+    } else {
+      const top = rect.bottom + 6;
+      setPosition({
+        top,
+        right,
+        maxHeight: Math.max(180, window.innerHeight - top - 12),
+      });
+    }
+    setOpen(true);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (
+        menuRef.current?.contains(target) ||
+        triggerRef.current?.contains(target)
+      ) {
+        return;
+      }
+      close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close(true);
+      }
+    };
+    const onReposition = () => close();
+
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", onReposition);
+    window.addEventListener("scroll", onReposition, true);
+
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", onReposition);
+      window.removeEventListener("scroll", onReposition, true);
+    };
+  }, [open, close]);
+
+  const hasDue =
+    customer.pending_balance !== null && customer.pending_balance > 0;
+  const whatsappUrl = getWhatsAppUrl(customer);
 
   return (
-    <a
-      className="rounded-lg px-2 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
-      href={`https://wa.me/${phone}?text=${encodeURIComponent(message)}`}
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      WhatsApp
-    </a>
+    <div className="relative inline-flex">
+      <button
+        ref={triggerRef}
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={`Actions for ${customer.name}`}
+        title="More actions"
+        onClick={toggle}
+        className={`inline-flex shrink-0 items-center justify-center rounded-lg transition ${
+          open
+            ? "bg-[#e7efe6] text-[#285d42]"
+            : "text-[#6c7870] hover:bg-[#edf2eb] hover:text-[#285d42]"
+        } ${triggerClassName || "h-8 w-8"}`}
+      >
+        <MoreVertical size={17} />
+      </button>
+
+      {open && position && (
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label={`Actions for ${customer.name}`}
+          style={{
+            position: "fixed",
+            top: position.top,
+            bottom: position.bottom,
+            right: position.right,
+            width: 224,
+            maxHeight: position.maxHeight,
+          }}
+          className="z-50 overflow-y-auto rounded-xl border border-[#e4e9e1] bg-white p-1.5 shadow-[0_12px_30px_rgba(24,40,30,0.16)]"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            className={menuItemClass}
+            onClick={() => {
+              close();
+              onDetails();
+            }}
+          >
+            <Eye size={15} className="text-[#7a8780]" />
+            Details
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!hasDue}
+            title={hasDue ? "Collect pending dues" : "No pending dues to collect"}
+            className={menuItemClass}
+            onClick={() => {
+              close();
+              onReceive();
+            }}
+          >
+            <Banknote size={15} className="text-[#7a8780]" />
+            Receive
+            {hasDue && (
+              <span className="ml-auto text-[11px] font-semibold text-red-600">
+                {formatMoney(customer.pending_balance as number)}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            className={menuItemClass}
+            onClick={() => {
+              close();
+              onLedger();
+            }}
+          >
+            <BookOpen size={15} className="text-[#7a8780]" />
+            Ledger
+          </button>
+
+          {whatsappUrl ? (
+            <a
+              role="menuitem"
+              href={whatsappUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={menuItemClass}
+              onClick={() => close()}
+            >
+              <MessageCircle size={15} className="text-emerald-600" />
+              WhatsApp
+            </a>
+          ) : (
+            <button
+              type="button"
+              role="menuitem"
+              disabled
+              title={
+                customer.pending_balance === null
+                  ? "The current balance is unavailable."
+                  : "A valid 10-digit phone number is required for WhatsApp."
+              }
+              className={menuItemClass}
+            >
+              <MessageCircle size={15} className="text-[#7a8780]" />
+              WhatsApp
+            </button>
+          )}
+
+          <div className="my-1 h-px bg-[#eef1eb]" />
+
+          <button
+            type="button"
+            role="menuitem"
+            className={menuItemClass}
+            onClick={() => {
+              close();
+              onEdit();
+            }}
+          >
+            <Edit size={15} className="text-[#7a8780]" />
+            Edit customer
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1801,125 +3041,6 @@ function SummaryCard({
   );
 }
 
-function SalesTrend({
-  businessDate,
-  dailyTotals,
-  available,
-}: {
-  businessDate: string;
-  dailyTotals: Record<string, DailyTotals>;
-  available: boolean;
-}) {
-  const lastDate = new Date(`${businessDate}T12:00:00`);
-  const dates = Array.from({ length: 14 }, (_, index) => {
-    const date = new Date(lastDate);
-    date.setDate(lastDate.getDate() - (13 - index));
-    return getBusinessDate(date);
-  });
-  const points = dates.map((date) => ({
-    date,
-    amount: dailyTotals[date]?.sales ?? 0,
-  }));
-  const highest = Math.max(...points.map((point) => point.amount), 1);
-  const total = points.reduce((sum, point) => sum + point.amount, 0);
-
-  return (
-    <section
-      aria-labelledby="sales-trend-heading"
-      className="rounded-2xl border border-[#e8ece5] bg-white p-5 shadow-[0_2px_8px_rgba(24,40,30,0.03)] sm:p-6"
-    >
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2">
-            <h2
-              id="sales-trend-heading"
-              className="text-base font-semibold tracking-[-0.02em] text-[#29382e]"
-            >
-              Sales overview
-            </h2>
-            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
-              14-Day Trend
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-[#838c85]">Daily billed sales revenue from real database transactions</p>
-        </div>
-        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-50 text-amber-700">
-          <BarChart3 size={18} />
-        </span>
-      </div>
-      {!available ? (
-        <div className="mt-6 rounded-xl border border-dashed border-[#e2e6df] bg-[#fafbf9] px-4 py-8 text-center text-sm text-[#7b847e]">
-          Sales history is incomplete, so a reliable trend cannot be displayed.
-        </div>
-      ) : total === 0 ? (
-        <div className="mt-6 rounded-xl border border-dashed border-[#e2e6df] bg-[#fafbf9] px-4 py-8 text-center text-sm text-[#7b847e]">
-          No sales are recorded in this 14-day window ending {formatDate(businessDate)}.
-        </div>
-      ) : (
-        <>
-          <div className="mt-6 flex items-end justify-between gap-1.5 border-b border-l border-[#edf0eb] px-1 pb-2 pt-2 sm:gap-2 sm:px-2">
-            {points.map((point) => {
-              const label = new Intl.DateTimeFormat("en-IN", {
-                day: "numeric",
-                month: "short",
-              }).format(new Date(`${point.date}T12:00:00`));
-              const isSelectedDate = point.date === businessDate;
-              return (
-                <div
-                  key={point.date}
-                  className="group relative flex min-w-0 flex-1 flex-col items-center justify-end"
-                  title={`${label}: ${formatMoney(point.amount)}`}
-                >
-                  <div className="flex h-36 w-full items-end justify-center">
-                    <span
-                      aria-label={`${label}: ${formatMoney(point.amount)}`}
-                      className={`w-[min(65%,24px)] rounded-t-md transition-all duration-200 ${
-                        point.amount > 0
-                          ? isSelectedDate
-                            ? "bg-[#285d42] group-hover:bg-[#1b432e]"
-                            : "bg-[#6d9f75] group-hover:bg-[#437852]"
-                          : "bg-[#edf1eb]"
-                      }`}
-                      style={{
-                        height: `${Math.max(
-                          point.amount > 0 ? 6 : 2,
-                          (point.amount / highest) * 100,
-                        )}%`,
-                      }}
-                    />
-                  </div>
-                  {([0, 4, 8, 13].includes(
-                    points.findIndex((candidate) => candidate.date === point.date),
-                  )) ? (
-                    <span
-                      className={`mt-2 whitespace-nowrap text-[9px] font-medium ${
-                        isSelectedDate ? "font-bold text-[#285d42]" : "text-[#879188]"
-                      }`}
-                    >
-                      {label}
-                    </span>
-                  ) : (
-                    <span className="mt-2 text-[9px] text-transparent" aria-hidden="true">
-                      ·
-                    </span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-[#f8faf7] px-3.5 py-2.5 text-xs text-[#6e7a71]">
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-[#285d42]" />
-              14-day cumulative volume
-            </span>
-            <span className="font-semibold text-[#2b3e30]">{formatMoney(total)}</span>
-          </div>
-        </>
-      )}
-    </section>
-  );
-}
-
 function RecentSales({
   sales,
   customers,
@@ -1929,21 +3050,57 @@ function RecentSales({
   customers: Customer[];
   complete: boolean;
 }) {
-  const customerNames = new Map(
-    customers.map((customer) => [customer.id, customer.name]),
+  const customerMap = new Map(
+    customers.map((customer) => [customer.id, customer]),
   );
+  const shownBilled = sales.reduce(
+    (sum, sale) => sum + Number(sale.total_amount),
+    0,
+  );
+  const shownPaid = sales.reduce(
+    (sum, sale) => sum + Number(sale.amount_paid),
+    0,
+  );
+  const shownDue = sales.reduce(
+    (sum, sale) => sum + Math.max(0, Number(sale.balance)),
+    0,
+  );
+
+  function itemsLabel(sale: CustomerSummaryResult["recentSales"][number]) {
+    return sale.sale_unit === "bulk"
+      ? `${Number(sale.sale_quantity)} kg`
+      : `${Number(sale.sale_quantity)} × ${sale.sale_unit}`;
+  }
+
+  function statusFor(sale: CustomerSummaryResult["recentSales"][number]) {
+    const balance = Number(sale.balance);
+    const paid = Number(sale.amount_paid);
+    if (balance <= 0) {
+      return {
+        label: "Paid",
+        className: "bg-emerald-50 text-emerald-800",
+      };
+    }
+    if (paid > 0) {
+      return {
+        label: "Partial",
+        className: "bg-amber-50 text-amber-700",
+      };
+    }
+    return { label: "Unpaid", className: "bg-red-50 text-red-700" };
+  }
 
   return (
     <section
       aria-labelledby="recent-sales-heading"
       className="overflow-hidden rounded-2xl border border-[#e8ece5] bg-white shadow-[0_2px_8px_rgba(24,40,30,0.03)]"
     >
-      <div className="flex items-start justify-between gap-4 px-5 py-5 sm:px-6">
+      <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#eef0eb] px-5 py-5 sm:px-6">
         <div>
           <div className="flex items-center gap-2">
             <h2
               id="recent-sales-heading"
-              className="text-base font-semibold tracking-[-0.02em] text-[#29382e]"
+              className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]"
             >
               Recent sales
             </h2>
@@ -1952,60 +3109,255 @@ function RecentSales({
             </span>
           </div>
           <p className="mt-1 text-xs text-[#838c85]">
-            Chronological sale entries with billed totals and balances
+            Chronological sale entries with billed totals, payments, and
+            balances. Newest first.
           </p>
         </div>
-        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#edf4eb] text-[#52795a]">
-          <ShoppingBag size={18} />
+        <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#edf4eb] text-[#52795a]">
+          <ShoppingBag size={19} />
         </span>
       </div>
+
+      <div className="grid grid-cols-2 gap-px border-b border-[#eef0eb] bg-[#eef0eb] sm:grid-cols-4">
+        {[
+          {
+            label: "Entries shown",
+            value: sales.length.toLocaleString("en-IN"),
+            tone: "text-[#29382e]",
+          },
+          {
+            label: "Billed value",
+            value: formatMoney(shownBilled),
+            tone: "text-[#29382e]",
+          },
+          {
+            label: "Paid at sale",
+            value: formatMoney(shownPaid),
+            tone: "text-[#285d42]",
+          },
+          {
+            label: "Outstanding",
+            value: formatMoney(shownDue),
+            tone: shownDue > 0 ? "text-red-600" : "text-emerald-700",
+          },
+        ].map((item) => (
+          <div key={item.label} className="bg-[#fbfcfa] px-5 py-3.5 sm:px-6">
+            <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#8d968e]">
+              {item.label}
+            </span>
+            <span
+              className={`mt-1 block text-sm font-bold tracking-[-0.02em] ${item.tone}`}
+            >
+              {item.value}
+            </span>
+          </div>
+        ))}
+      </div>
+
       {!complete && (
-        <p className="border-y border-amber-100 bg-amber-50 px-5 py-2.5 text-xs leading-5 text-amber-800">
+        <p className="border-b border-amber-100 bg-amber-50 px-5 py-2.5 text-xs leading-5 text-amber-800">
           Showing the newest available entries only. All-time totals are withheld
           because the sales history exceeds the safe read limit.
         </p>
       )}
+
       {sales.length === 0 ? (
-        <div className="border-t border-[#eef0eb] px-5 py-10 text-center text-sm text-[#7b847e]">
-          No sales have been recorded yet.
+        <div className="px-5 py-14 text-center">
+          <ShoppingBag className="mx-auto text-[#8ca18d]" size={24} />
+          <p className="mt-2 text-sm font-semibold text-[#405046]">
+            No sales have been recorded yet
+          </p>
+          <p className="mt-1 text-xs text-[#8a938c]">
+            Record a sale to see its billed amount, payment, and balance here.
+          </p>
         </div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[480px] text-left">
-            <thead className="border-y border-[#eef0eb] bg-[#fbfcfa]">
-              <tr className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#969e97]">
-                <th className="px-5 py-2.5">Date · Customer</th>
-                <th className="px-3 py-2.5 text-right">Billed</th>
-                <th className="px-5 py-2.5 text-right">Due / பாக்கி</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#eef0eb]">
-              {sales.map((sale) => (
-                <tr key={sale.id} className="transition-colors hover:bg-[#fafbf9]">
-                  <td className="px-5 py-3">
-                    <span className="block text-xs font-semibold text-[#37463a]">
-                      {customerNames.get(sale.customer_id) ?? "Customer"}
-                    </span>
-                    <span className="mt-0.5 block text-[10px] text-[#929b93]">
-                      {formatDate(sale.sale_date)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 text-right text-xs font-medium text-[#4b5a4f]">
-                    {formatMoney(Number(sale.total_amount))}
-                  </td>
-                  <td
-                    className={`px-5 py-3 text-right text-xs font-semibold ${
-                      Number(sale.balance) > 0 ? "text-red-600" : "text-emerald-700"
-                    }`}
-                  >
-                    {formatMoney(Number(sale.balance))}
-                  </td>
+        <>
+          <div className="hidden overflow-x-auto md:block">
+            <table className="w-full min-w-[860px] text-left">
+              <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
+                <tr className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#969e97]">
+                  <th className="px-5 py-3">Date</th>
+                  <th className="px-4 py-3">Customer</th>
+                  <th className="px-4 py-3">Items</th>
+                  <th className="px-4 py-3 text-right">Billed</th>
+                  <th className="px-4 py-3 text-right">Paid</th>
+                  <th className="px-4 py-3 text-right">Balance / பாக்கி</th>
+                  <th className="px-5 py-3 text-center">Status</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody className="divide-y divide-[#eef0eb]">
+                {sales.map((sale) => {
+                  const customer = customerMap.get(sale.customer_id);
+                  const status = statusFor(sale);
+                  const billed = Number(sale.total_amount);
+                  const paid = Number(sale.amount_paid);
+                  const balance = Number(sale.balance);
+
+                  return (
+                    <tr
+                      key={sale.id}
+                      className="transition-colors hover:bg-[#fafbf9]"
+                    >
+                      <td className="whitespace-nowrap px-5 py-3.5">
+                        <span className="block text-xs font-semibold text-[#37463a]">
+                          {formatDate(sale.sale_date)}
+                        </span>
+                        <span className="mt-0.5 block text-[10px] text-[#929b93]">
+                          {new Intl.DateTimeFormat("en-IN", {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          }).format(new Date(sale.created_at))}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3.5">
+                        <span className="block text-sm font-semibold text-[#29382e]">
+                          {customer?.name ?? "Customer"}
+                        </span>
+                        <span className="mt-0.5 block text-[11px] text-[#8e9891]">
+                          {customer?.phone || "No phone"}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3.5">
+                        <span className="inline-flex rounded-md bg-[#f2f5ef] px-2 py-0.5 text-[11px] font-semibold text-[#5d6c61]">
+                          {itemsLabel(sale)}
+                        </span>
+                        <span className="mt-1 block text-[10px] text-[#929b93]">
+                          @ {formatMoney(Number(sale.rate_per_unit))}
+                          {sale.sale_unit === "bulk" ? " / kg" : " each"}
+                        </span>
+                        {sale.notes && (
+                          <span className="mt-0.5 block max-w-[200px] truncate text-[10px] italic text-[#a0a79f]">
+                            {sale.notes}
+                          </span>
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-semibold text-[#3c4a3f]">
+                        {formatMoney(billed)}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-medium text-[#285d42]">
+                        {formatMoney(paid)}
+                      </td>
+                      <td
+                        className={`whitespace-nowrap px-4 py-3.5 text-right text-sm font-bold ${
+                          balance > 0 ? "text-red-600" : "text-emerald-700"
+                        }`}
+                      >
+                        {formatMoney(balance)}
+                      </td>
+                      <td className="px-5 py-3.5 text-center">
+                        <span
+                          className={`inline-block rounded-full px-2.5 py-0.5 text-[10px] font-bold ${status.className}`}
+                        >
+                          {status.label}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <ul className="divide-y divide-[#eef0eb] md:hidden">
+            {sales.map((sale) => {
+              const customer = customerMap.get(sale.customer_id);
+              const status = statusFor(sale);
+              const billed = Number(sale.total_amount);
+              const paid = Number(sale.amount_paid);
+              const balance = Number(sale.balance);
+
+              return (
+                <li key={sale.id} className="px-4 py-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-[11px] font-semibold text-[#657368]">
+                          {formatDate(sale.sale_date)}
+                        </span>
+                        <span className="text-[10px] text-[#a0a79f]">
+                          {new Intl.DateTimeFormat("en-IN", {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          }).format(new Date(sale.created_at))}
+                        </span>
+                      </div>
+                      <p className="mt-1 truncate text-sm font-semibold text-[#29382e]">
+                        {customer?.name ?? "Customer"}
+                      </p>
+                      <p className="text-[11px] text-[#8e9891]">
+                        {customer?.phone || "No phone"}
+                      </p>
+                    </div>
+                    <span
+                      className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${status.className}`}
+                    >
+                      {status.label}
+                    </span>
+                  </div>
+
+                  <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px] text-[#6e7b71]">
+                    <span className="rounded-md bg-[#f2f5ef] px-1.5 py-0.5 font-semibold text-[#5d6c61]">
+                      {itemsLabel(sale)}
+                    </span>
+                    <span>
+                      @ {formatMoney(Number(sale.rate_per_unit))}
+                      {sale.sale_unit === "bulk" ? " / kg" : " each"}
+                    </span>
+                    {sale.notes && (
+                      <span className="w-full truncate italic text-[#a0a79f]">
+                        {sale.notes}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-3 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-center text-xs">
+                    <div>
+                      <span className="block text-[10px] text-[#818d83]">
+                        Billed
+                      </span>
+                      <span className="mt-0.5 block font-semibold text-[#324036]">
+                        {formatMoney(billed)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="block text-[10px] text-[#818d83]">
+                        Paid
+                      </span>
+                      <span className="mt-0.5 block font-semibold text-[#285d42]">
+                        {formatMoney(paid)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="block text-[10px] text-[#818d83]">
+                        Balance
+                      </span>
+                      <span
+                        className={`mt-0.5 block font-bold ${
+                          balance > 0 ? "text-red-600" : "text-emerald-700"
+                        }`}
+                      >
+                        {formatMoney(balance)}
+                      </span>
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
       )}
+
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-[11px] text-[#8d968e]">
+        <span>
+          Showing latest {sales.length} sale{sales.length === 1 ? "" : "s"} ·
+          Newest entries first
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="h-1.5 w-1.5 rounded-full bg-[#6da57a]" />
+          Balance = billed − paid at sale
+        </span>
+      </div>
     </section>
   );
 }
@@ -2068,13 +3420,15 @@ function modalTitle(modal: Exclude<ModalKind, null>) {
     case "edit-customer":
       return "Edit customer profile";
     case "customer-details":
-      return "Customer Details & Khata";
+      return "Customer Details & Ledger";
     case "sale":
       return "Record a daily sale";
     case "payment":
       return "Record a payment";
     case "ledger":
       return "Customer ledger";
+    case "stock":
+      return "Add stock";
   }
 }
 
@@ -2331,7 +3685,7 @@ function SaleForm({
           <span className="font-semibold text-[#35483a]">{formatMoney(bill)}</span>
         </div>
         <div className="mt-2.5 flex items-center justify-between border-t border-[#e7ede5] pt-2.5 text-sm">
-          <span className="text-[#6c796f]">Added to khata</span>
+          <span className="text-[#6c796f]">Added to balance</span>
           <span className="font-semibold text-[#9a6133]">{formatMoney(balance)}</span>
         </div>
       </div>

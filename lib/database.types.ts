@@ -108,6 +108,33 @@ export type Database = {
         };
         Relationships: [];
       };
+      stock_entries: {
+        Row: {
+          id: string;
+          stock_unit: "500g" | "1kg" | "bulk";
+          quantity: number;
+          added_on: string;
+          note: string | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          stock_unit: "500g" | "1kg" | "bulk";
+          quantity: number;
+          added_on?: string;
+          note?: string | null;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          stock_unit?: "500g" | "1kg" | "bulk";
+          quantity?: number;
+          added_on?: string;
+          note?: string | null;
+          created_at?: string;
+        };
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {

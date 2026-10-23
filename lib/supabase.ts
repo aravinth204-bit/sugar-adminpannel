@@ -19,6 +19,10 @@ export type RecentSale = {
   total_amount: number;
   amount_paid: number;
   balance: number;
+  sale_unit: "500g" | "1kg" | "bulk";
+  sale_quantity: number;
+  rate_per_unit: number;
+  notes: string | null;
   created_at: string;
 };
 
@@ -70,6 +74,41 @@ export type LedgerEntry =
       created_at: string;
     };
 
+export type StockUnit = "500g" | "1kg" | "bulk";
+
+export type StockEntry =
+  Database["public"]["Tables"]["stock_entries"]["Row"];
+
+export type StockUnitSummary = {
+  unit: StockUnit;
+  added: number;
+  sold: number;
+  remaining: number;
+  trackingSince: string | null;
+  lastEntry: StockEntry | null;
+  soldSinceLastEntry: number;
+};
+
+export type StockOverview = {
+  available: boolean;
+  entries: StockEntry[];
+  units: Record<StockUnit, StockUnitSummary>;
+  totalStockedPackets: number;
+  totalSoldPackets: number;
+  packetsInHand: number;
+  bulkRemaining: number;
+  lastEntry: StockEntry | null;
+  soldSinceByEntry: Record<string, number>;
+  warning: string | null;
+};
+
+type StockSaleRow = {
+  sale_unit: StockUnit;
+  sale_quantity: number;
+  sale_date: string;
+  created_at: string;
+};
+
 export type DashboardStats = {
   todaysSale: number;
   todaysCashCollected: number;
@@ -83,6 +122,10 @@ type SalesSummaryRow = Pick<
   | "total_amount"
   | "amount_paid"
   | "balance"
+  | "sale_unit"
+  | "sale_quantity"
+  | "rate_per_unit"
+  | "notes"
   | "created_at"
 >;
 type PaymentSummaryRow = Pick<
@@ -217,13 +260,13 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       await supabase
         .from("sales")
         .select(
-          "id, customer_id, sale_date, total_amount, amount_paid, balance, created_at",
+          "id, customer_id, sale_date, total_amount, amount_paid, balance, sale_unit, sale_quantity, rate_per_unit, notes, created_at",
           { count: from === 0 ? "exact" : undefined },
         )
         .order("sale_date", { ascending: false })
         .order("id", { ascending: false })
         .range(from, to),
-    ).catch((error: unknown) => handleMissingLedgerTable<SalesSummaryRow>(error)),
+    ).catch((error: unknown) => handleMissingTable<SalesSummaryRow>(error)),
     fetchAllPages<PaymentSummaryRow>(async (from, to) =>
       await supabase
         .from("payments")
@@ -234,7 +277,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
         .order("id", { ascending: false })
         .range(from, to),
     ).catch((error: unknown) =>
-      handleMissingLedgerTable<PaymentSummaryRow>(error),
+      handleMissingTable<PaymentSummaryRow>(error),
     ),
   ]);
 
@@ -390,7 +433,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     outstanding:
       outstandingCents === null ? null : fromCents(outstandingCents),
     dailyTotals,
-    recentSales: canUseSales ? sales.slice(0, 8) : [],
+    recentSales: canUseSales ? sales.slice(0, 25) : [],
     salesAvailable,
     salesComplete,
     paymentsAvailable,
@@ -400,7 +443,7 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
   };
 }
 
-async function handleMissingLedgerTable<T>(
+async function handleMissingTable<T>(
   error: unknown,
 ): Promise<PagedRows<T> | null> {
   if (
@@ -610,4 +653,162 @@ export async function fetchCustomerLedger(
       right.date.localeCompare(left.date) ||
       right.created_at.localeCompare(left.created_at),
   );
+}
+
+const STOCK_UNITS: StockUnit[] = ["500g", "1kg", "bulk"];
+
+function emptyStockUnit(unit: StockUnit): StockUnitSummary {
+  return {
+    unit,
+    added: 0,
+    sold: 0,
+    remaining: 0,
+    trackingSince: null,
+    lastEntry: null,
+    soldSinceLastEntry: 0,
+  };
+}
+
+export async function fetchStockOverview(): Promise<StockOverview> {
+  const supabase = getSupabaseClient();
+  const [entriesResult, salesResult] = await Promise.all([
+    fetchAllPages<StockEntry>(async (from, to) =>
+      await supabase
+        .from("stock_entries")
+        .select("id, stock_unit, quantity, added_on, note, created_at", {
+          count: from === 0 ? "exact" : undefined,
+        })
+        .order("added_on", { ascending: false })
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
+        .range(from, to),
+    ).catch((error: unknown) => handleMissingTable<StockEntry>(error)),
+    fetchAllPages<StockSaleRow>(async (from, to) =>
+      await supabase
+        .from("sales")
+        .select("sale_unit, sale_quantity, sale_date, created_at", {
+          count: from === 0 ? "exact" : undefined,
+        })
+        .order("sale_date", { ascending: false })
+        .order("id", { ascending: false })
+        .range(from, to),
+    ).catch((error: unknown) => handleMissingTable<StockSaleRow>(error)),
+  ]);
+
+  const entries = entriesResult?.rows ?? [];
+  const sales = salesResult?.rows ?? [];
+  const available = entriesResult !== null && salesResult !== null;
+  const warnings: string[] = [];
+
+  if (!entriesResult) {
+    warnings.push(
+      "Stock tracking is not set up yet. Apply supabase/migrations/20261023000000_stock_entries.sql to your Supabase project.",
+    );
+  }
+  if (!salesResult) {
+    warnings.push(
+      "Sales data is unavailable, so sold quantities could not be calculated.",
+    );
+  }
+  if (entriesResult && !entriesResult.complete) {
+    warnings.push(
+      "Stock entries exceed the dashboard safety limit; stock totals may be incomplete.",
+    );
+  }
+  if (salesResult && !salesResult.complete) {
+    warnings.push(
+      `Sales exceed the ${MAX_DASHBOARD_ROWS.toLocaleString("en-IN")} row dashboard safety limit; sold and remaining quantities may be incomplete.`,
+    );
+  }
+
+  const units = Object.fromEntries(
+    STOCK_UNITS.map((unit) => [unit, emptyStockUnit(unit)]),
+  ) as Record<StockUnit, StockUnitSummary>;
+
+  for (const entry of entries) {
+    units[entry.stock_unit].added += Number(entry.quantity);
+  }
+
+  // Only sales recorded from the first stock update for a packet size are
+  // deducted, so sales that happened before stock tracking started do not
+  // create a false negative balance.
+  for (const unit of STOCK_UNITS) {
+    const firstEntry = [...entries]
+      .reverse()
+      .find((entry) => entry.stock_unit === unit);
+    units[unit].trackingSince = firstEntry?.added_on ?? null;
+  }
+  for (const sale of sales) {
+    const since = units[sale.sale_unit].trackingSince;
+    if (since && sale.sale_date >= since) {
+      units[sale.sale_unit].sold += Number(sale.sale_quantity);
+    }
+  }
+
+  for (const unit of STOCK_UNITS) {
+    const summary = units[unit];
+    summary.remaining = summary.added - summary.sold;
+    summary.lastEntry =
+      entries.find((entry) => entry.stock_unit === unit) ?? null;
+  }
+
+  const soldSinceByEntry: Record<string, number> = {};
+  for (const entry of entries) {
+    soldSinceByEntry[entry.id] = sales.reduce(
+      (sum, sale) =>
+        sale.sale_unit === entry.stock_unit && sale.sale_date >= entry.added_on
+          ? sum + Number(sale.sale_quantity)
+          : sum,
+      0,
+    );
+  }
+  for (const unit of STOCK_UNITS) {
+    const lastEntry = units[unit].lastEntry;
+    units[unit].soldSinceLastEntry = lastEntry
+      ? soldSinceByEntry[lastEntry.id] ?? 0
+      : 0;
+  }
+
+  return {
+    available,
+    entries,
+    units,
+    totalStockedPackets: units["500g"].added + units["1kg"].added,
+    totalSoldPackets: units["500g"].sold + units["1kg"].sold,
+    packetsInHand: units["500g"].remaining + units["1kg"].remaining,
+    bulkRemaining: units.bulk.remaining,
+    lastEntry: entries[0] ?? null,
+    soldSinceByEntry,
+    warning: warnings.length ? warnings.join(" ") : null,
+  };
+}
+
+export async function addStockEntry(input: {
+  stockUnit: StockUnit;
+  quantity: number;
+  addedOn?: string;
+  note?: string;
+}): Promise<StockEntry> {
+  if (!STOCK_UNITS.includes(input.stockUnit)) {
+    throw new Error("Select a valid stock type.");
+  }
+  if (!Number.isFinite(input.quantity) || input.quantity <= 0) {
+    throw new Error("Stock quantity must be greater than zero.");
+  }
+  if (input.stockUnit !== "bulk" && !Number.isInteger(input.quantity)) {
+    throw new Error("Packet quantity must be a whole number.");
+  }
+
+  const { data, error } = await getSupabaseClient()
+    .from("stock_entries")
+    .insert({
+      stock_unit: input.stockUnit,
+      quantity: input.quantity,
+      added_on: input.addedOn || getBusinessDate(),
+      note: input.note?.trim() || null,
+    })
+    .select("id, stock_unit, quantity, added_on, note, created_at")
+    .single();
+
+  return requireData(data, error);
 }

@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Karumbu Ledger — Sales & Khata",
-  description: "Cane sugar sales and customer khata ledger administration.",
+  title: "Karumbu Ledger — Sales & Customers",
+  description: "Cane sugar sales and customer ledger administration.",
 };
 
 export default function RootLayout({
