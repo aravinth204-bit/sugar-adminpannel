@@ -12,8 +12,10 @@ import {
   Check,
   ChevronDown,
   CircleHelp,
+  Download,
   Edit,
   Eye,
+  HandCoins,
   IndianRupee,
   LayoutDashboard,
   LoaderCircle,
@@ -32,6 +34,7 @@ import {
   ShoppingBag,
   Sprout,
   Users,
+  Wallet,
   X,
 } from "lucide-react";
 import {
@@ -53,11 +56,13 @@ import {
   getBusinessDate,
   getSupabaseClient,
   recordStandalonePayment,
+  setOpeningBalance,
   updateSale,
   type Customer,
   type CustomerSummaryResult,
   type DailyTotals,
   type LedgerEntry,
+  type PaymentMethod,
   type SaleRecord,
   type StockOverview,
   type StockUnit,
@@ -80,6 +85,13 @@ function formatMoney(amount: number) {
 
 function formatOptionalMoney(amount: number | null) {
   return amount === null ? "Unavailable" : formatMoney(amount);
+}
+
+function formatSignedBalance(amount: number) {
+  const rounded = Math.round(amount * 100) / 100;
+  if (rounded > 0) return `− ${formatMoney(rounded)}`;
+  if (rounded < 0) return `+ ${formatMoney(Math.abs(rounded))}`;
+  return formatMoney(0);
 }
 
 function formatMetric(
@@ -112,6 +124,19 @@ function today() {
   return getBusinessDate();
 }
 
+function localDateTimeInputValue(date = new Date()) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function safeWhatsAppPhone(phone: string | null) {
+  const digits = (phone ?? "").replace(/\D/g, "");
+  if (digits.length === 10) return `91${digits}`;
+  if (digits.startsWith("0") && digits.length === 11) return `91${digits.slice(1)}`;
+  if (digits.length >= 11 && digits.length <= 15) return digits;
+  return "";
+}
+
 type ModalKind =
   | "customer"
   | "edit-customer"
@@ -122,6 +147,8 @@ type ModalKind =
   | "receipt"
   | "payment"
   | "ledger"
+  | "reminder"
+  | "opening-balance"
   | "stock"
   | null;
 
@@ -141,20 +168,25 @@ export default function Home() {
   const [dataLoading, setDataLoading] = useState(false);
   const [dataError, setDataError] = useState("");
   const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<"all" | "due" | "settled" | "no-sales">("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | "due" | "advance" | "settled" | "no-sales">("all");
   const [modal, setModal] = useState<ModalKind>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
   const [selectedSale, setSelectedSale] = useState<SaleRecord | null>(null);
   const [viewingCustomer, setViewingCustomer] = useState<Customer | null>(null);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [ledgerInitialKind, setLedgerInitialKind] = useState<
+    "all" | "sale" | "payment" | "opening"
+  >("all");
   const [salesHistory, setSalesHistory] = useState<SaleRecord[]>([]);
   const [salesHistoryLoading, setSalesHistoryLoading] = useState(false);
   const [salesHistoryError, setSalesHistoryError] = useState("");
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
-  const [activeTab, setActiveTab] = useState<"overview" | "customers" | "sales" | "stock">("overview");
+  const [activeTab, setActiveTab] = useState<
+    "overview" | "customers" | "sales" | "payments" | "stock"
+  >("overview");
   const [mobileMenu, setMobileMenu] = useState(false);
   const [stock, setStock] = useState<StockOverview | null>(null);
   const [stockLoading, setStockLoading] = useState(false);
@@ -298,16 +330,24 @@ export default function Home() {
       if (statusFilter === "due") {
         return customer.pending_balance !== null && customer.pending_balance > 0;
       }
+      if (statusFilter === "advance") {
+        return (
+          customer.advance_balance !== null && customer.advance_balance > 0
+        );
+      }
       if (statusFilter === "settled") {
         return (
-          customer.total_billed !== null &&
-          customer.total_billed > 0 &&
-          customer.pending_balance === 0
+          (customer.pending_balance === 0 ||
+            customer.pending_balance === null) &&
+          (customer.advance_balance === 0 ||
+            customer.advance_balance === null) &&
+          (customer.total_billed ?? 0) + (customer.opening_balance ?? 0) > 0
         );
       }
       if (statusFilter === "no-sales") {
         return (
-          customer.total_billed === 0 ||
+          ((customer.total_billed ?? 0) === 0 &&
+            (customer.opening_balance ?? 0) === 0) ||
           (customer.total_billed === null && customer.pending_balance === null)
         );
       }
@@ -398,6 +438,14 @@ export default function Home() {
     }
   }
 
+  function openLedger(
+    customer: Customer,
+    kind: "all" | "sale" | "payment" | "opening" = "all",
+  ) {
+    setLedgerInitialKind(kind);
+    openModal("ledger", customer);
+  }
+
   function openSaleModal(
     kind: "edit-sale" | "cancel-sale" | "receipt",
     sale: SaleRecord,
@@ -466,6 +514,7 @@ export default function Home() {
             total_billed: null,
             total_paid: null,
             pending_balance: null,
+            advance_balance: null,
           },
         ].sort((left, right) => left.name.localeCompare(right.name));
       });
@@ -639,13 +688,32 @@ export default function Home() {
     setFormError("");
     const form = new FormData(event.currentTarget);
     try {
+      const paymentCustomerId = String(form.get("customerId") ?? "");
+      const paymentAmount = Number(form.get("amount") || 0);
+      const customerBeforePayment = customers.find(
+        (customer) => customer.id === paymentCustomerId,
+      );
+      const dueBeforePayment = customerBeforePayment?.pending_balance ?? 0;
+      const advanceAdded = Math.max(
+        0,
+        Math.round((paymentAmount - dueBeforePayment) * 100) / 100,
+      );
+      const paidAtValue = String(form.get("paidAt") ?? "");
+      const paidAt = paidAtValue ? new Date(paidAtValue) : new Date();
+      const paymentMethod = String(
+        form.get("paymentMethod") ?? "cash",
+      ) as PaymentMethod;
       await recordStandalonePayment({
-        customerId: String(form.get("customerId") ?? ""),
-        amount: Number(form.get("amount")),
-        paymentDate: String(form.get("paymentDate") ?? today()),
+        customerId: paymentCustomerId,
+        amount: paymentAmount,
+        paymentDate: paidAtValue
+          ? paidAtValue.slice(0, 10)
+          : today(),
+        paidAt: paidAt.toISOString(),
+        paymentMethod,
+        reference: String(form.get("reference") ?? ""),
         notes: String(form.get("notes") ?? ""),
       });
-      const paymentCustomerId = String(form.get("customerId") ?? "");
       const customersRefreshed = await refreshCustomers();
       let ledgerRefreshed = true;
       if (
@@ -663,11 +731,45 @@ export default function Home() {
         !ledgerRefreshed
           ? "Payment recorded, but transaction history could not be refreshed. Reopen the customer to reload it."
           : customersRefreshed
-            ? "Payment recorded against the customer's pending dues."
+            ? advanceAdded > 0
+              ? `Payment recorded. Dues cleared and ${formatMoney(advanceAdded)} saved as customer advance.`
+              : "Payment recorded against the customer's pending dues."
             : "Payment recorded, but the customer list could not be refreshed. Use Try again to reload it.",
       );
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Unable to record payment.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleOpeningBalance(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setFormError("");
+    const form = new FormData(event.currentTarget);
+    try {
+      const customerId = String(form.get("customerId") ?? "");
+      await setOpeningBalance({
+        customerId,
+        amount: Number(form.get("amount") || 0),
+        effectiveDate: String(form.get("effectiveDate") ?? today()),
+        notes: String(form.get("notes") ?? ""),
+      });
+      const refreshed = await refreshCustomers();
+      setModal(null);
+      setSelectedCustomer(null);
+      setSuccessMessage(
+        refreshed
+          ? "Opening balance saved. It is included in dues but not counted as a sale or new collection."
+          : "Opening balance saved, but the customer list could not be refreshed. Use Refresh to reload it.",
+      );
+    } catch (error) {
+      setFormError(
+        error instanceof Error
+          ? error.message
+          : "Unable to save the opening balance.",
+      );
     } finally {
       setSaving(false);
     }
@@ -842,6 +944,21 @@ export default function Home() {
           <button
             type="button"
             onClick={() => {
+              setActiveTab("payments");
+              setMobileMenu(false);
+            }}
+            className={`mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+              activeTab === "payments"
+                ? "bg-[#eef4ee] text-[#285d42] font-semibold"
+                : "text-[#717b74] hover:bg-[#f7f8f5] hover:text-[#25372c]"
+            }`}
+          >
+            <HandCoins size={18} strokeWidth={1.8} />
+            Payments &amp; Due
+          </button>
+          <button
+            type="button"
+            onClick={() => {
               setActiveTab("sales");
               setMobileMenu(false);
             }}
@@ -956,12 +1073,14 @@ export default function Home() {
               <h2 className="mt-2 text-[27px] font-semibold tracking-[-0.045em] sm:text-[34px]">
                 {activeTab === "overview" && "Dashboard"}
                 {activeTab === "customers" && "Customer Directory & Balances"}
+                {activeTab === "payments" && "Payments & Due Ledger"}
                 {activeTab === "sales" && "Sales & Management"}
                 {activeTab === "stock" && "Packet Stock & Inventory"}
               </h2>
               <p className="mt-1.5 max-w-xl text-sm leading-6 text-[#7b847e]">
                 {activeTab === "overview" && "Daily sales, collections, pending balances, monthly sales, and stock at a glance."}
                 {activeTab === "customers" && "Search customer records, add new customers, and collect pending dues."}
+                {activeTab === "payments" && "Track customer-wise dues, receive full or partial payments, manage opening balances and advances, and send WhatsApp reminders."}
                 {activeTab === "sales" && "Record KG or packet sales, take cash or UPI payments, apply discounts, and manage the full sales history."}
                 {activeTab === "stock" && "See how many packets you stocked, how many sold, and how much stock is left in hand."}
               </p>
@@ -1036,7 +1155,7 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
                 <SummaryCard
                   label="Today's Sales"
                   value={formatMetric(dailySales, dataLoading, dataStale)}
@@ -1065,6 +1184,17 @@ export default function Home() {
                   detail="All-time outstanding across customers"
                   icon={<IndianRupee size={19} />}
                   accent="red"
+                />
+                <SummaryCard
+                  label="Customer Advances"
+                  value={formatMetric(
+                    dashboardData?.totalAdvance,
+                    dataLoading,
+                    dataStale,
+                  )}
+                  detail="Extra paid, kept for future purchases"
+                  icon={<Wallet size={19} />}
+                  accent="green"
                 />
                 <SummaryCard
                   label={`${monthLabel} Sales`}
@@ -1175,6 +1305,24 @@ export default function Home() {
                   </button>
                   <button
                     type="button"
+                    onClick={() => setStatusFilter("advance")}
+                    className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                      statusFilter === "advance"
+                        ? "bg-white text-sky-700 shadow-sm"
+                        : "text-[#6d7970] hover:text-sky-700"
+                    }`}
+                  >
+                    Advance (
+                    {
+                      customers.filter(
+                        (c) =>
+                          c.advance_balance !== null && c.advance_balance > 0,
+                      ).length
+                    }
+                    )
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setStatusFilter("settled")}
                     className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
                       statusFilter === "settled"
@@ -1188,7 +1336,9 @@ export default function Home() {
                         (c) =>
                           c.total_billed !== null &&
                           c.total_billed > 0 &&
-                          c.pending_balance === 0,
+                          c.pending_balance === 0 &&
+                          (c.advance_balance === 0 ||
+                            c.advance_balance === null),
                       ).length
                     }
                     )
@@ -1273,13 +1423,14 @@ export default function Home() {
                 <>
                   {/* Desktop Table View */}
                   <div className="hidden overflow-x-auto lg:block">
-                    <table className="w-full min-w-[1000px] border-collapse text-left">
+                    <table className="w-full min-w-[1120px] border-collapse text-left">
                       <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
                         <tr className="text-[10px] font-semibold uppercase tracking-[0.13em] text-[#969e97]">
                           <th className="px-5 py-3">Customer Name</th>
                           <th className="px-4 py-3">Contact &amp; Area</th>
                           <th className="px-4 py-3 text-right">Total Billed</th>
                           <th className="px-4 py-3 text-right">Total Paid</th>
+                          <th className="px-4 py-3 text-right">Advance</th>
                           <th className="px-4 py-3 text-right">Balance / பாக்கி</th>
                           <th className="px-4 py-3 text-center">Status</th>
                           <th className="px-5 py-3 text-right">Actions</th>
@@ -1290,10 +1441,14 @@ export default function Home() {
                           const hasDue =
                             customer.pending_balance !== null &&
                             customer.pending_balance > 0;
+                          const hasAdvance =
+                            customer.advance_balance !== null &&
+                            customer.advance_balance > 0;
                           const isSettled =
                             customer.total_billed !== null &&
                             customer.total_billed > 0 &&
-                            customer.pending_balance === 0;
+                            customer.pending_balance === 0 &&
+                            !hasAdvance;
 
                           return (
                             <tr
@@ -1334,6 +1489,17 @@ export default function Home() {
                                 {formatOptionalMoney(customer.total_paid)}
                               </td>
                               <td
+                                className={`px-4 py-4 text-right text-sm font-semibold ${
+                                  hasAdvance
+                                    ? "text-sky-700"
+                                    : "text-[#9aa39b]"
+                                }`}
+                              >
+                                {hasAdvance
+                                  ? formatMoney(customer.advance_balance as number)
+                                  : "—"}
+                              </td>
+                              <td
                                 className={`px-4 py-4 text-right text-sm font-bold ${
                                   hasDue
                                     ? "text-red-600"
@@ -1348,6 +1514,10 @@ export default function Home() {
                                 {hasDue ? (
                                   <span className="inline-block rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-semibold text-red-700">
                                     Due
+                                  </span>
+                                ) : hasAdvance ? (
+                                  <span className="inline-block rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-700">
+                                    Advance
                                   </span>
                                 ) : isSettled ? (
                                   <span className="inline-block rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
@@ -1390,10 +1560,14 @@ export default function Home() {
                       const hasDue =
                         customer.pending_balance !== null &&
                         customer.pending_balance > 0;
+                      const hasAdvance =
+                        customer.advance_balance !== null &&
+                        customer.advance_balance > 0;
                       const isSettled =
                         customer.total_billed !== null &&
                         customer.total_billed > 0 &&
-                        customer.pending_balance === 0;
+                        customer.pending_balance === 0 &&
+                        !hasAdvance;
 
                       return (
                         <div
@@ -1434,6 +1608,10 @@ export default function Home() {
                                 <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700">
                                   Due
                                 </span>
+                              ) : hasAdvance ? (
+                                <span className="rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-bold text-sky-700">
+                                  Advance
+                                </span>
                               ) : isSettled ? (
                                 <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-800">
                                   Paid
@@ -1457,7 +1635,7 @@ export default function Home() {
                           </div>
 
                           {/* Metrics grid for mobile */}
-                          <div className="mt-3.5 grid grid-cols-3 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-center text-xs">
+                          <div className="mt-3.5 grid grid-cols-4 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-center text-xs">
                             <div>
                               <span className="block text-[10px] text-[#818d83]">Billed</span>
                               <span className="mt-0.5 block font-semibold text-[#324036]">
@@ -1468,6 +1646,20 @@ export default function Home() {
                               <span className="block text-[10px] text-[#818d83]">Paid</span>
                               <span className="mt-0.5 block font-semibold text-[#285d42]">
                                 {formatOptionalMoney(customer.total_paid)}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="block text-[10px] text-[#818d83]">Advance</span>
+                              <span
+                                className={`mt-0.5 block font-semibold ${
+                                  hasAdvance
+                                    ? "text-sky-700"
+                                    : "text-[#8f9891]"
+                                }`}
+                              >
+                                {hasAdvance
+                                  ? formatMoney(customer.advance_balance as number)
+                                  : "—"}
                               </span>
                             </div>
                             <div>
@@ -1504,6 +1696,24 @@ export default function Home() {
             </div>
           </section>
         )}
+
+          {activeTab === "payments" && (
+            <PaymentsDueLedgerPage
+              customers={customers}
+              summary={dashboardData}
+              loading={dataLoading}
+              stale={dataStale}
+              error={dataError}
+              onRefresh={() => void refreshCustomers()}
+              onReceivePayment={(customer) => openModal("payment", customer)}
+              onViewLedger={(customer) => openLedger(customer, "all")}
+              onViewPurchases={(customer) => openLedger(customer, "sale")}
+              onReminder={(customer) => openModal("reminder", customer)}
+              onOpeningBalance={(customer) =>
+                openModal("opening-balance", customer)
+              }
+            />
+          )}
 
           {activeTab === "stock" && (
             <StockPage
@@ -1806,7 +2016,27 @@ export default function Home() {
               entries={ledger}
               loading={ledgerLoading}
               error={formError}
+              initialKind={ledgerInitialKind}
               onReceivePayment={() => openModal("payment", selectedCustomer)}
+              onReminder={() => openModal("reminder", selectedCustomer)}
+            />
+          )}
+
+          {modal === "reminder" && selectedCustomer && (
+            <ReminderModal
+              customer={selectedCustomer}
+              onClose={closeModal}
+            />
+          )}
+
+          {modal === "opening-balance" && (
+            <OpeningBalanceForm
+              customers={customers}
+              saving={saving}
+              error={formError}
+              onSubmit={handleOpeningBalance}
+              onCancel={closeModal}
+              initialCustomerId={selectedCustomer?.id ?? ""}
             />
           )}
 
@@ -1839,21 +2069,17 @@ function CustomerDetailsView({
   onReceivePayment: () => void;
   onEditCustomer: () => void;
 }) {
-  const phoneDigits = (customer.phone ?? "").replace(/\D/g, "");
-  const whatsappPhone =
-    phoneDigits.length === 10
-      ? `91${phoneDigits}`
-      : phoneDigits.startsWith("0") && phoneDigits.length === 11
-        ? `91${phoneDigits.slice(1)}`
-        : phoneDigits;
+  const whatsappPhone = safeWhatsAppPhone(customer.phone);
   const whatsappMessage = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatOptionalMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
   const whatsappHref =
-    whatsappPhone && customer.pending_balance !== null
+    whatsappPhone && (customer.pending_balance ?? 0) > 0
       ? `https://wa.me/${whatsappPhone}?text=${encodeURIComponent(whatsappMessage)}`
       : null;
 
   const salesEntries = entries.filter((e) => e.kind === "sale");
   const paymentEntries = entries.filter((e) => e.kind === "payment");
+  const hasAdvance =
+    customer.advance_balance !== null && customer.advance_balance > 0;
 
   return (
     <div className="space-y-5">
@@ -1872,6 +2098,10 @@ function CustomerDetailsView({
                 {customer.pending_balance !== null && customer.pending_balance > 0 ? (
                   <span className="rounded-md bg-red-100 px-2 py-0.5 text-[11px] font-semibold text-red-700">
                     Due Pending
+                  </span>
+                ) : hasAdvance ? (
+                  <span className="rounded-md bg-sky-100 px-2 py-0.5 text-[11px] font-semibold text-sky-700">
+                    Advance {formatMoney(customer.advance_balance as number)}
                   </span>
                 ) : customer.total_billed !== null && customer.total_billed > 0 && customer.pending_balance === 0 ? (
                   <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
@@ -1924,7 +2154,7 @@ function CustomerDetailsView({
         </div>
 
         {/* Financial Summary */}
-        <div className="mt-4 grid grid-cols-3 gap-2 border-t border-[#e2e7e0] pt-3 text-center sm:gap-3">
+        <div className="mt-4 grid grid-cols-2 gap-2 border-t border-[#e2e7e0] pt-3 text-center sm:grid-cols-4 sm:gap-3">
           <div className="rounded-xl bg-white p-2.5 shadow-sm">
             <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#79857c]">
               Total Billed
@@ -1955,6 +2185,20 @@ function CustomerDetailsView({
               {formatOptionalMoney(customer.pending_balance)}
             </span>
           </div>
+          <div className="rounded-xl bg-white p-2.5 shadow-sm">
+            <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#79857c]">
+              Advance Credit
+            </span>
+            <span
+              className={`mt-1 block text-sm font-bold ${
+                hasAdvance ? "text-sky-700" : "text-[#8b938d]"
+              }`}
+            >
+              {hasAdvance
+                ? formatMoney(customer.advance_balance as number)
+                : formatOptionalMoney(customer.advance_balance)}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -1963,13 +2207,11 @@ function CustomerDetailsView({
         <button
           type="button"
           className={primaryButton}
-          disabled={
-            customer.pending_balance === null || customer.pending_balance <= 0
-          }
+          disabled={customer.pending_balance === null}
           onClick={onReceivePayment}
         >
           <Banknote size={16} />
-          Receive Due Payment
+          Receive Payment / Advance
         </button>
         {whatsappHref ? (
           <a
@@ -2029,7 +2271,12 @@ function CustomerDetailsView({
                   <th className="px-3 py-2.5">Type &amp; Description</th>
                   <th className="px-3 py-2.5 text-right">Debit</th>
                   <th className="px-3 py-2.5 text-right">Credit</th>
-                  <th className="px-3.5 py-2.5 text-right">Balance</th>
+                  <th className="px-3.5 py-2.5 text-right">
+                    Balance
+                    <span className="ml-1 font-normal normal-case tracking-normal text-[#a7afa9]">
+                      (due − / advance +)
+                    </span>
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#eef0eb]">
@@ -2049,6 +2296,11 @@ function CustomerDetailsView({
                             : `${entry.sale_quantity} × ${entry.sale_unit} @ ${formatMoney(entry.rate_per_unit)}`}
                         </span>
                       )}
+                      {entry.kind === "sale" && ledgerAdvanceNote(entry) && (
+                        <span className="block text-[10px] font-medium text-sky-700">
+                          {ledgerAdvanceNote(entry)}
+                        </span>
+                      )}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2.5 text-right text-[#4d5c50]">
                       {entry.debit ? formatMoney(entry.debit) : "—"}
@@ -2056,8 +2308,16 @@ function CustomerDetailsView({
                     <td className="whitespace-nowrap px-3 py-2.5 text-right text-[#285d42]">
                       {entry.credit ? formatMoney(entry.credit) : "—"}
                     </td>
-                    <td className="whitespace-nowrap px-3.5 py-2.5 text-right font-semibold text-[#48564c]">
-                      {formatMoney(entry.balance)}
+                    <td
+                      className={`whitespace-nowrap px-3.5 py-2.5 text-right font-semibold ${
+                        entry.balance > 0
+                          ? "text-red-600"
+                          : entry.balance < 0
+                            ? "text-sky-700"
+                            : "text-[#48564c]"
+                      }`}
+                    >
+                      {formatSignedBalance(entry.balance)}
                     </td>
                   </tr>
                 ))}
@@ -2575,24 +2835,32 @@ function CustomerProfilePage({
 }) {
   const hasDue =
     customer.pending_balance !== null && customer.pending_balance > 0;
+  const hasAdvance =
+    customer.advance_balance !== null && customer.advance_balance > 0;
   const isSettled =
-    customer.total_billed !== null &&
-    customer.total_billed > 0 &&
-    customer.pending_balance === 0;
+    (customer.total_billed ?? 0) + (customer.opening_balance ?? 0) > 0 &&
+    customer.pending_balance === 0 &&
+    !hasAdvance;
+  const closingBalance =
+    customer.pending_balance !== null && customer.pending_balance > 0
+      ? customer.pending_balance
+      : customer.advance_balance !== null && customer.advance_balance > 0
+        ? -customer.advance_balance
+        : 0;
   const whatsappHref = getWhatsAppUrl(customer);
   const salesCount = entries.filter((entry) => entry.kind === "sale").length;
   const paymentCount = entries.filter((entry) => entry.kind === "payment").length;
   const lastPurchase = entries.find((entry) => entry.kind === "sale");
   const lastPayment = entries.find((entry) => entry.kind === "payment");
+  const totalObligation =
+    (customer.total_billed ?? 0) + (customer.opening_balance ?? 0);
   const paidPercent =
-    customer.total_billed !== null &&
-    customer.total_billed > 0 &&
-    customer.total_paid !== null
+    totalObligation > 0 && customer.total_paid !== null
       ? Math.min(
           100,
           Math.max(
             0,
-            Math.round((customer.total_paid / customer.total_billed) * 100),
+            Math.round((customer.total_paid / totalObligation) * 100),
           ),
         )
       : null;
@@ -2637,6 +2905,10 @@ function CustomerProfilePage({
                   <span className="rounded-md bg-red-100 px-2 py-0.5 text-[11px] font-semibold text-red-700">
                     Due Pending
                   </span>
+                ) : hasAdvance ? (
+                  <span className="rounded-md bg-sky-100 px-2 py-0.5 text-[11px] font-semibold text-sky-700">
+                    Advance {formatMoney(customer.advance_balance as number)}
+                  </span>
                 ) : isSettled ? (
                   <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
                     Fully Paid
@@ -2677,7 +2949,7 @@ function CustomerProfilePage({
           </button>
         </div>
 
-        <div className="grid gap-3 p-5 sm:grid-cols-3 sm:p-6">
+        <div className="grid gap-3 p-5 sm:grid-cols-4 sm:p-6">
           <div className="rounded-xl border border-[#eef0eb] bg-[#fbfcfa] p-4">
             <span className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#87928a]">
               <Package size={13} />
@@ -2688,6 +2960,11 @@ function CustomerProfilePage({
             </p>
             <p className="mt-1 text-[11px] text-[#939c95]">
               வாங்கியது · {salesCount} sales
+              {(customer.opening_balance ?? 0) > 0 && (
+                <span className="block text-[#9a6133]">
+                  Previous due {formatMoney(customer.opening_balance ?? 0)}
+                </span>
+              )}
             </p>
           </div>
           <div className="rounded-xl border border-[#e3ede3] bg-[#f6faf5] p-4">
@@ -2730,6 +3007,45 @@ function CustomerProfilePage({
               }`}
             >
               {hasDue ? "இன்னும் செலுத்த வேண்டியது" : "All dues cleared"}
+              {(customer.opening_balance ?? 0) > 0 && (
+                <span className="block">
+                  Includes opening {formatMoney(customer.opening_balance ?? 0)}
+                </span>
+              )}
+            </p>
+          </div>
+          <div
+            className={`rounded-xl border p-4 ${
+              hasAdvance
+                ? "border-[#d8e8f2] bg-[#f4fafd]"
+                : "border-[#eef0eb] bg-[#fbfcfa]"
+            }`}
+          >
+            <span
+              className={`flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] ${
+                hasAdvance ? "text-[#3f7a99]" : "text-[#87928a]"
+              }`}
+            >
+              <Wallet size={13} />
+              Advance Credit
+            </span>
+            <p
+              className={`mt-2 text-xl font-bold tracking-[-0.03em] sm:text-2xl ${
+                hasAdvance ? "text-sky-700" : "text-[#7d8a81]"
+              }`}
+            >
+              {hasAdvance
+                ? formatMoney(customer.advance_balance as number)
+                : formatOptionalMoney(customer.advance_balance)}
+            </p>
+            <p
+              className={`mt-1 text-[11px] ${
+                hasAdvance ? "text-[#6f98ad]" : "text-[#939c95]"
+              }`}
+            >
+              {hasAdvance
+                ? "முன்பணம் · used on next purchase"
+                : "No advance balance"}
             </p>
           </div>
         </div>
@@ -2791,13 +3107,11 @@ function CustomerProfilePage({
         <button
           type="button"
           className={primaryButton}
-          disabled={
-            customer.pending_balance === null || customer.pending_balance <= 0
-          }
+          disabled={customer.pending_balance === null}
           onClick={onReceivePayment}
         >
           <Banknote size={16} />
-          Receive Due Payment
+          Receive Payment / Advance
         </button>
         {whatsappHref ? (
           <a
@@ -2877,7 +3191,12 @@ function CustomerProfilePage({
                     <th className="px-4 py-2.5">Type &amp; Description</th>
                     <th className="px-4 py-2.5 text-right">Billed</th>
                     <th className="px-4 py-2.5 text-right">Paid</th>
-                    <th className="px-5 py-2.5 text-right">Balance</th>
+                    <th className="px-5 py-2.5 text-right">
+                      Balance
+                      <span className="ml-1 font-normal normal-case tracking-normal text-[#a7afa9]">
+                        (due − / advance +)
+                      </span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#eef0eb]">
@@ -2898,7 +3217,11 @@ function CustomerProfilePage({
                                 : "bg-emerald-50 text-emerald-700"
                             }`}
                           >
-                            {entry.kind === "sale" ? "Sale" : "Payment"}
+                            {entry.kind === "sale"
+                              ? "Sale"
+                              : entry.kind === "opening"
+                                ? "Opening"
+                                : "Payment"}
                           </span>
                           <span className="font-semibold text-[#2f3f33]">
                             {entry.description}
@@ -2911,6 +3234,11 @@ function CustomerProfilePage({
                               : `${entry.sale_quantity} × ${entry.sale_unit} @ ${formatMoney(entry.rate_per_unit)}`}
                           </span>
                         )}
+                        {entry.kind === "sale" && ledgerAdvanceNote(entry) && (
+                          <span className="mt-0.5 block text-[10px] font-medium text-sky-700">
+                            {ledgerAdvanceNote(entry)}
+                          </span>
+                        )}
                       </td>
                       <td className="whitespace-nowrap px-4 py-3 text-right text-[#4d5c50]">
                         {entry.debit ? formatMoney(entry.debit) : "—"}
@@ -2918,8 +3246,16 @@ function CustomerProfilePage({
                       <td className="whitespace-nowrap px-4 py-3 text-right font-medium text-[#285d42]">
                         {entry.credit ? formatMoney(entry.credit) : "—"}
                       </td>
-                      <td className="whitespace-nowrap px-5 py-3 text-right font-semibold text-[#48564c]">
-                        {formatMoney(running)}
+                      <td
+                        className={`whitespace-nowrap px-5 py-3 text-right font-semibold ${
+                          running > 0
+                            ? "text-red-600"
+                            : running < 0
+                              ? "text-sky-700"
+                              : "text-[#48564c]"
+                        }`}
+                      >
+                        {formatSignedBalance(running)}
                       </td>
                     </tr>
                   ))}
@@ -2937,10 +3273,37 @@ function CustomerProfilePage({
                     </td>
                     <td
                       className={`px-5 py-3 text-right ${
-                        hasDue ? "text-red-600" : "text-emerald-700"
+                        closingBalance > 0
+                          ? "text-red-600"
+                          : closingBalance < 0
+                            ? "text-sky-700"
+                            : "text-emerald-700"
                       }`}
                     >
-                      {formatOptionalMoney(customer.pending_balance)}
+                      {formatSignedBalance(closingBalance)}
+                    </td>
+                  </tr>
+                  <tr className="border-t border-[#e5e9e2] text-xs">
+                    <td
+                      className="px-5 py-2.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#7b887e]"
+                      colSpan={4}
+                    >
+                      {closingBalance > 0
+                        ? "Closing balance · customer has to pay"
+                        : closingBalance < 0
+                          ? "Closing balance · customer advance"
+                          : "Closing balance · fully settled"}
+                    </td>
+                    <td
+                      className={`px-5 py-2.5 text-right text-sm font-bold ${
+                        closingBalance > 0
+                          ? "text-red-600"
+                          : closingBalance < 0
+                            ? "text-sky-700"
+                            : "text-emerald-700"
+                      }`}
+                    >
+                      {formatSignedBalance(closingBalance)}
                     </td>
                   </tr>
                 </tfoot>
@@ -2963,7 +3326,11 @@ function CustomerProfilePage({
                               : "bg-emerald-50 text-emerald-700"
                           }`}
                         >
-                          {entry.kind === "sale" ? "Sale" : "Payment"}
+                          {entry.kind === "sale"
+                            ? "Sale"
+                            : entry.kind === "opening"
+                              ? "Opening"
+                              : "Payment"}
                         </span>
                         <span className="text-[11px] font-medium text-[#87928a]">
                           {formatDate(entry.date)}
@@ -2979,6 +3346,11 @@ function CustomerProfilePage({
                             : `${entry.sale_quantity} × ${entry.sale_unit} @ ${formatMoney(entry.rate_per_unit)}`}
                         </p>
                       )}
+                      {entry.kind === "sale" && ledgerAdvanceNote(entry) && (
+                        <p className="mt-0.5 text-[11px] font-medium text-sky-700">
+                          {ledgerAdvanceNote(entry)}
+                        </p>
+                      )}
                     </div>
                     <div className="shrink-0 text-right">
                       {entry.debit > 0 && (
@@ -2991,14 +3363,62 @@ function CustomerProfilePage({
                           −{formatMoney(entry.credit)}
                         </p>
                       )}
-                      <p className="mt-0.5 text-[10px] text-[#98a19a]">
-                        Bal. {formatMoney(running)}
+                      <p
+                        className={`mt-0.5 text-[10px] font-semibold ${
+                          running > 0
+                            ? "text-red-600"
+                            : running < 0
+                              ? "text-sky-700"
+                              : "text-[#98a19a]"
+                        }`}
+                      >
+                        Bal. {formatSignedBalance(running)}
                       </p>
                     </div>
                   </div>
                 </li>
               ))}
             </ul>
+
+            <div className="border-t border-[#e5e9e2] bg-[#f8faf7] px-4 py-3 md:hidden">
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <span className="block text-[10px] uppercase tracking-wider text-[#8d968e]">
+                    Total billed
+                  </span>
+                  <span className="mt-0.5 block font-semibold text-[#405046]">
+                    {formatOptionalMoney(customer.total_billed)}
+                  </span>
+                </div>
+                <div className="text-right">
+                  <span className="block text-[10px] uppercase tracking-wider text-[#8d968e]">
+                    Total paid
+                  </span>
+                  <span className="mt-0.5 block font-semibold text-[#285d42]">
+                    {formatOptionalMoney(customer.total_paid)}
+                  </span>
+                </div>
+              </div>
+              <div className="mt-2.5 flex items-center justify-between border-t border-[#e2e7e0] pt-2.5">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-[#7b887e]">
+                  Closing balance
+                  <span className="ml-1 font-normal normal-case tracking-normal text-[#a0a9a2]">
+                    (due − / advance +)
+                  </span>
+                </span>
+                <span
+                  className={`text-sm font-bold ${
+                    closingBalance > 0
+                      ? "text-red-600"
+                      : closingBalance < 0
+                        ? "text-sky-700"
+                        : "text-emerald-700"
+                  }`}
+                >
+                  {formatSignedBalance(closingBalance)}
+                </span>
+              </div>
+            </div>
           </>
         )}
       </section>
@@ -3034,14 +3454,8 @@ function BrandMark() {
 }
 
 function getWhatsAppUrl(customer: Customer) {
-  const digits = (customer.phone ?? "").replace(/\D/g, "");
-  const phone =
-    digits.length === 10
-      ? `91${digits}`
-      : digits.length === 12 && digits.startsWith("91")
-        ? digits
-        : null;
-  if (!phone || customer.pending_balance === null) return null;
+  const phone = safeWhatsAppPhone(customer.phone);
+  if (!phone || (customer.pending_balance ?? 0) <= 0) return null;
   const message = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatOptionalMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
   return `https://wa.me/${phone}?text=${encodeURIComponent(message)}`;
 }
@@ -3155,6 +3569,9 @@ function CustomerActionsMenu({
 
   const hasDue =
     customer.pending_balance !== null && customer.pending_balance > 0;
+  const hasAdvance =
+    customer.advance_balance !== null && customer.advance_balance > 0;
+  const canReceive = customer.pending_balance !== null;
   const whatsappUrl = getWhatsAppUrl(customer);
 
   return (
@@ -3207,8 +3624,12 @@ function CustomerActionsMenu({
           <button
             type="button"
             role="menuitem"
-            disabled={!hasDue}
-            title={hasDue ? "Collect pending dues" : "No pending dues to collect"}
+            disabled={!canReceive}
+            title={
+              canReceive
+                ? "Collect dues or save an extra payment as advance"
+                : "Customer balances are unavailable"
+            }
             className={menuItemClass}
             onClick={() => {
               close();
@@ -3216,10 +3637,15 @@ function CustomerActionsMenu({
             }}
           >
             <Banknote size={15} className="text-[#7a8780]" />
-            Receive
+            Receive / Advance
             {hasDue && (
               <span className="ml-auto text-[11px] font-semibold text-red-600">
                 {formatMoney(customer.pending_balance as number)}
+              </span>
+            )}
+            {hasAdvance && (
+              <span className="ml-auto text-[11px] font-semibold text-sky-700">
+                {formatMoney(customer.advance_balance as number)}
               </span>
             )}
           </button>
@@ -3630,8 +4056,23 @@ function saleItemsLabel(sale: SaleRecord) {
     : `${Number(sale.sale_quantity)} × ${sale.sale_unit}`;
 }
 
-function paymentMethodLabel(method: SaleRecord["payment_method"]) {
-  return method === "upi" ? "UPI" : "Cash";
+function ledgerAdvanceNote(entry: LedgerEntry) {
+  if (entry.kind !== "sale") return "";
+  const parts: string[] = [];
+  if (entry.credit_applied > 0) {
+    parts.push(`Advance used ${formatMoney(entry.credit_applied)}`);
+  }
+  if (entry.overpaid_amount > 0) {
+    parts.push(`Extra to advance ${formatMoney(entry.overpaid_amount)}`);
+  }
+  return parts.join(" · ");
+}
+
+function paymentMethodLabel(method: PaymentMethod) {
+  if (method === "upi") return "UPI";
+  if (method === "bank") return "Bank transfer";
+  if (method === "other") return "Other";
+  return "Cash";
 }
 
 function saleStatusBadge(sale: SaleRecord) {
@@ -3640,7 +4081,15 @@ function saleStatusBadge(sale: SaleRecord) {
   }
   const balance = Number(sale.balance);
   const paid = Number(sale.amount_paid);
+  const overpaid = Number(sale.overpaid_amount);
+  const creditUsed = Number(sale.credit_applied ?? 0);
   if (balance <= 0) {
+    if (overpaid > 0) {
+      return { label: "Paid + Adv", className: "bg-sky-50 text-sky-700" };
+    }
+    if (creditUsed > 0) {
+      return { label: "Advance", className: "bg-sky-50 text-sky-700" };
+    }
     return { label: "Paid", className: "bg-emerald-50 text-emerald-800" };
   }
   if (paid > 0) {
@@ -3704,6 +4153,10 @@ function SalesManagement({
       sum + Number(sale.amount_paid) + Number(sale.overpaid_amount),
     0,
   );
+  const advancesUsed = completed.reduce(
+    (sum, sale) => sum + Number(sale.credit_applied ?? 0),
+    0,
+  );
   const outstanding = completed.reduce(
     (sum, sale) => sum + Math.max(0, Number(sale.balance)),
     0,
@@ -3732,7 +4185,7 @@ function SalesManagement({
 
   const summaryItems = [
     {
-      label: "Entries shown",
+      label: "Sales shown",
       value: filtered.length.toLocaleString("en-IN"),
       tone: "text-[#29382e]",
     },
@@ -3747,17 +4200,17 @@ function SalesManagement({
       tone: "text-[#285d42]",
     },
     {
-      label: "Cash",
-      value: formatMoney(cashCollected),
+      label: "Cash / UPI",
+      value: `${formatMoney(cashCollected)} / ${formatMoney(upiCollected)}`,
       tone: "text-emerald-700",
     },
     {
-      label: "UPI",
-      value: formatMoney(upiCollected),
+      label: "Advance used",
+      value: formatMoney(advancesUsed),
       tone: "text-sky-700",
     },
     {
-      label: "Outstanding at sale",
+      label: "Due at sale",
       value: formatMoney(outstanding),
       tone: outstanding > 0 ? "text-red-600" : "text-emerald-700",
     },
@@ -3792,9 +4245,27 @@ function SalesManagement({
             )}
           </div>
           <p className="mt-1 text-xs text-[#838c85]">
-            Every sale with discount, payment method, edit, cancel, and receipt
-            actions. Newest first.
+            Each row shows what was sold, how much was paid, how much advance
+            was used, and what is still due. Newest sales first.
           </p>
+          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-[#7c877f]">
+            <span>
+              <strong className="font-semibold text-[#285d42]">Paid now</strong>{" "}
+              = cash/UPI received at sale
+            </span>
+            <span className="text-[#c2c9c1]">·</span>
+            <span>
+              <strong className="font-semibold text-sky-700">
+                Advance used
+              </strong>{" "}
+              = old credit adjusted
+            </span>
+            <span className="text-[#c2c9c1]">·</span>
+            <span>
+              <strong className="font-semibold text-red-600">Due</strong> =
+              still to pay
+            </span>
+          </div>
         </div>
         <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#edf4eb] text-[#52795a]">
           <ShoppingBag size={19} />
@@ -3897,17 +4368,15 @@ function SalesManagement({
       ) : (
         <>
           <div className="hidden overflow-x-auto lg:block">
-            <table className="w-full min-w-[1160px] text-left">
+            <table className="w-full min-w-[1080px] text-left">
               <thead className="border-b border-[#eef0eb] bg-[#fbfcfa]">
                 <tr className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#969e97]">
                   <th className="px-5 py-3">Date</th>
                   <th className="px-4 py-3">Customer</th>
-                  <th className="px-4 py-3">Items</th>
-                  <th className="px-4 py-3">Payment</th>
-                  <th className="px-4 py-3 text-right">Billed</th>
-                  <th className="px-4 py-3 text-right">Paid</th>
-                  <th className="px-4 py-3 text-right">Extra paid</th>
-                  <th className="px-4 py-3 text-right">Balance at sale</th>
+                  <th className="px-4 py-3">Sale details</th>
+                  <th className="px-4 py-3">Payment breakdown</th>
+                  <th className="px-4 py-3 text-right">Bill</th>
+                  <th className="px-4 py-3 text-right">Balance</th>
                   <th className="px-4 py-3 text-center">Status</th>
                   <th className="px-5 py-3 text-right">Actions</th>
                 </tr>
@@ -3917,9 +4386,9 @@ function SalesManagement({
                   const customer = customerMap.get(sale.customer_id);
                   const status = saleStatusBadge(sale);
                   const total = Number(sale.total_amount);
-                  const paid =
-                    Number(sale.amount_paid) + Number(sale.overpaid_amount);
+                  const paidNow = Number(sale.amount_paid);
                   const overpaid = Number(sale.overpaid_amount);
+                  const creditUsed = Number(sale.credit_applied ?? 0);
                   const balance = Number(sale.balance);
                   const isCancelled = sale.status === "cancelled";
 
@@ -3973,7 +4442,7 @@ function SalesManagement({
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-3.5">
+                      <td className="px-4 py-3.5 align-top">
                         <span
                           className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${
                             sale.payment_method === "upi"
@@ -3983,9 +4452,37 @@ function SalesManagement({
                         >
                           {paymentMethodLabel(sale.payment_method)}
                         </span>
+                        <div className="mt-2 space-y-1 text-[11px]">
+                          <div className="flex items-baseline justify-between gap-3">
+                            <span className="text-[#7c877f]">Paid now</span>
+                            <span className="font-semibold text-[#285d42]">
+                              {formatMoney(paidNow)}
+                            </span>
+                          </div>
+                          {creditUsed > 0 && (
+                            <div className="flex items-baseline justify-between gap-3">
+                              <span className="text-[#7c877f]">
+                                Advance used
+                              </span>
+                              <span className="font-semibold text-sky-700">
+                                {formatMoney(creditUsed)}
+                              </span>
+                            </div>
+                          )}
+                          {overpaid > 0 && (
+                            <div className="flex items-baseline justify-between gap-3">
+                              <span className="text-[#7c877f]">
+                                Extra → advance
+                              </span>
+                              <span className="font-semibold text-sky-700">
+                                {formatMoney(overpaid)}
+                              </span>
+                            </div>
+                          )}
+                        </div>
                       </td>
                       <td
-                        className={`whitespace-nowrap px-4 py-3.5 text-right text-sm font-semibold ${
+                        className={`whitespace-nowrap px-4 py-3.5 text-right align-top text-sm font-semibold ${
                           isCancelled
                             ? "text-[#9aa39b] line-through"
                             : "text-[#3c4a3f]"
@@ -3993,22 +4490,48 @@ function SalesManagement({
                       >
                         {formatMoney(total)}
                       </td>
-                      <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-medium text-[#285d42]">
-                        {formatMoney(paid)}
-                      </td>
-                      <td className="whitespace-nowrap px-4 py-3.5 text-right text-sm font-medium text-[#285d42]">
-                        {overpaid > 0 ? formatMoney(overpaid) : "—"}
-                      </td>
-                      <td
-                        className={`whitespace-nowrap px-4 py-3.5 text-right text-sm font-bold ${
-                          isCancelled
-                            ? "text-[#9aa39b]"
-                            : balance > 0
-                              ? "text-red-600"
-                              : "text-emerald-700"
-                        }`}
-                      >
-                        {isCancelled ? "—" : formatMoney(balance)}
+                      <td className="whitespace-nowrap px-4 py-3.5 text-right align-top">
+                        {isCancelled ? (
+                          <span className="text-sm font-semibold text-[#9aa39b]">
+                            —
+                          </span>
+                        ) : balance > 0 ? (
+                          <>
+                            <span className="block text-sm font-bold text-red-600">
+                              Due {formatMoney(balance)}
+                            </span>
+                            <span className="mt-0.5 block text-[10px] text-[#b07c74]">
+                              still to pay
+                            </span>
+                          </>
+                        ) : overpaid > 0 ? (
+                          <>
+                            <span className="block text-sm font-bold text-sky-700">
+                              Advance {formatMoney(overpaid)}
+                            </span>
+                            <span className="mt-0.5 block text-[10px] text-[#6f98ad]">
+                              saved for next sale
+                            </span>
+                          </>
+                        ) : creditUsed > 0 ? (
+                          <>
+                            <span className="block text-sm font-bold text-emerald-700">
+                              Settled
+                            </span>
+                            <span className="mt-0.5 block text-[10px] text-[#7d9483]">
+                              covered by advance
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="block text-sm font-bold text-emerald-700">
+                              Settled
+                            </span>
+                            <span className="mt-0.5 block text-[10px] text-[#7d9483]">
+                              fully paid
+                            </span>
+                          </>
+                        )}
                       </td>
                       <td className="px-4 py-3.5 text-center">
                         <span
@@ -4064,9 +4587,9 @@ function SalesManagement({
               const customer = customerMap.get(sale.customer_id);
               const status = saleStatusBadge(sale);
               const total = Number(sale.total_amount);
-              const paid =
-                Number(sale.amount_paid) + Number(sale.overpaid_amount);
+              const paidNow = Number(sale.amount_paid);
               const overpaid = Number(sale.overpaid_amount);
+              const creditUsed = Number(sale.credit_applied ?? 0);
               const balance = Number(sale.balance);
               const isCancelled = sale.status === "cancelled";
 
@@ -4138,10 +4661,10 @@ function SalesManagement({
                     )}
                   </div>
 
-                  <div className="mt-3 grid grid-cols-2 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-center text-xs">
+                  <div className="mt-3 grid grid-cols-2 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-xs">
                     <div>
                       <span className="block text-[10px] text-[#818d83]">
-                        Billed
+                        Bill
                       </span>
                       <span
                         className={`mt-0.5 block font-semibold ${
@@ -4153,23 +4676,39 @@ function SalesManagement({
                         {formatMoney(total)}
                       </span>
                     </div>
-                    <div>
+                    <div className="text-right">
                       <span className="block text-[10px] text-[#818d83]">
-                        Paid
+                        Paid now
                       </span>
                       <span className="mt-0.5 block font-semibold text-[#285d42]">
-                        {formatMoney(paid)}
+                        {formatMoney(paidNow)}
                       </span>
                     </div>
                     <div>
                       <span className="block text-[10px] text-[#818d83]">
-                        Extra paid
+                        Advance used
                       </span>
-                      <span className="mt-0.5 block font-semibold text-[#285d42]">
+                      <span
+                        className={`mt-0.5 block font-semibold ${
+                          creditUsed > 0 ? "text-sky-700" : "text-[#a7b0a9]"
+                        }`}
+                      >
+                        {creditUsed > 0 ? formatMoney(creditUsed) : "—"}
+                      </span>
+                    </div>
+                    <div className="text-right">
+                      <span className="block text-[10px] text-[#818d83]">
+                        Extra → advance
+                      </span>
+                      <span
+                        className={`mt-0.5 block font-semibold ${
+                          overpaid > 0 ? "text-sky-700" : "text-[#a7b0a9]"
+                        }`}
+                      >
                         {overpaid > 0 ? formatMoney(overpaid) : "—"}
                       </span>
                     </div>
-                    <div>
+                    <div className="col-span-2 border-t border-[#e6ebe3] pt-2">
                       <span className="block text-[10px] text-[#818d83]">
                         Balance
                       </span>
@@ -4179,10 +4718,20 @@ function SalesManagement({
                             ? "text-[#9aa39b]"
                             : balance > 0
                               ? "text-red-600"
-                              : "text-emerald-700"
+                              : overpaid > 0
+                                ? "text-sky-700"
+                                : "text-emerald-700"
                         }`}
                       >
-                        {isCancelled ? "—" : formatMoney(balance)}
+                        {isCancelled
+                          ? "—"
+                          : balance > 0
+                            ? `Due ${formatMoney(balance)}`
+                            : overpaid > 0
+                              ? `Advance ${formatMoney(overpaid)}`
+                              : creditUsed > 0
+                                ? "Settled by advance"
+                                : "Settled"}
                       </span>
                     </div>
                   </div>
@@ -4226,13 +4775,12 @@ function SalesManagement({
 
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-[11px] text-[#8d968e]">
         <span>
-          {filtered.length} entr{filtered.length === 1 ? "y" : "ies"} · Newest
-          first · Cancelled sales are excluded from balances and stock · Status
-          reflects payment at sale time
+          {filtered.length} sale{filtered.length === 1 ? "" : "s"} · Newest
+          first · Cancelled sales do not affect balances or stock
         </span>
         <span className="flex items-center gap-1.5">
           <span className="h-1.5 w-1.5 rounded-full bg-[#6da57a]" />
-          Balance = billed − paid
+          Due = bill − paid now − advance used
         </span>
       </div>
     </section>
@@ -4252,6 +4800,7 @@ function ReceiptView({
   const discount = Number(sale.discount_amount);
   const gross = total + discount;
   const overpaid = Number(sale.overpaid_amount);
+  const creditUsed = Number(sale.credit_applied ?? 0);
   const paid = Number(sale.amount_paid) + overpaid;
   const balance = Number(sale.balance);
 
@@ -4319,6 +4868,14 @@ function ReceiptView({
             {formatMoney(paid)}
           </span>
         </div>
+        {creditUsed > 0 && (
+          <div className="flex justify-between gap-4">
+            <span className="text-[#7d877f]">Advance used</span>
+            <span className="font-semibold text-sky-700">
+              {formatMoney(creditUsed)}
+            </span>
+          </div>
+        )}
         {overpaid > 0 && (
           <div className="flex justify-between gap-4">
             <span className="text-[#7d877f]">Extra paid · advance</span>
@@ -4397,6 +4954,7 @@ function printReceipt(sale: SaleRecord, customer: Customer | undefined) {
   const discount = Number(sale.discount_amount);
   const gross = total + discount;
   const overpaid = Number(sale.overpaid_amount);
+  const creditUsed = Number(sale.credit_applied ?? 0);
   const paid = Number(sale.amount_paid) + overpaid;
   const balance = Number(sale.balance);
   const receiptNumber = sale.id.slice(0, 8).toUpperCase();
@@ -4446,6 +5004,7 @@ function printReceipt(sale: SaleRecord, customer: Customer | undefined) {
     <div class="divider"></div>
     <div class="row total"><span>Total</span><span>${escapeHtml(formatMoney(total))}</span></div>
     <div class="row"><span class="muted">Paid</span><span class="strong">${escapeHtml(formatMoney(paid))}</span></div>
+    ${creditUsed > 0 ? `<div class="row"><span class="muted">Advance used</span><span class="strong">${escapeHtml(formatMoney(creditUsed))}</span></div>` : ""}
     ${overpaid > 0 ? `<div class="row"><span class="muted">Extra paid · advance</span><span class="strong">${escapeHtml(formatMoney(overpaid))}</span></div>` : ""}
     <div class="row strong"><span>Balance</span><span>${escapeHtml(formatMoney(balance))}</span></div>
     <div class="row"><span class="muted">Payment</span><span class="strong">${escapeHtml(paymentMethodLabel(sale.payment_method))}</span></div>
@@ -4532,6 +5091,10 @@ function modalTitle(modal: Exclude<ModalKind, null>) {
       return "Record a payment";
     case "ledger":
       return "Customer ledger";
+    case "reminder":
+      return "WhatsApp payment reminder";
+    case "opening-balance":
+      return "Opening / previous balance";
     case "stock":
       return "Add stock";
   }
@@ -4623,7 +5186,12 @@ function CustomerSelect({
           <option key={customer.id} value={customer.id}>
             {customer.name}
             {includeBalances
-              ? ` · ${formatOptionalMoney(customer.pending_balance)} due`
+              ? customer.pending_balance != null && customer.pending_balance > 0
+                ? ` · ${formatMoney(customer.pending_balance)} due`
+                : customer.advance_balance != null &&
+                    customer.advance_balance > 0
+                  ? ` · ${formatMoney(customer.advance_balance)} advance`
+                  : " · no due"
               : ""}
           </option>
         ))}
@@ -4685,12 +5253,17 @@ function SaleForm({
     Math.round(Number(quantity || 0) * Number(price || 0) * 100) / 100;
   const discountValue = Math.max(0, Number(discount || 0));
   const total = Math.max(0, Math.round((gross - discountValue) * 100) / 100);
-  const balance = Math.max(0, total - Number(paid || 0));
-  const overpaid = Math.max(0, Number(paid || 0) - total);
   const isNewCustomer = !isEditing && customerId === "__new_customer__";
   const selectedCustomer = customers.find(
     (customer) => customer.id === customerId,
   );
+  const advanceAvailable = isEditing
+    ? 0
+    : Math.max(0, selectedCustomer?.advance_balance ?? 0);
+  const advanceApplied = Math.min(advanceAvailable, total);
+  const payableTotal = Math.max(0, total - advanceApplied);
+  const balance = Math.max(0, payableTotal - Number(paid || 0));
+  const overpaid = Math.max(0, Number(paid || 0) - payableTotal);
 
   return (
     <form onSubmit={onSubmit} className="space-y-4">
@@ -4850,14 +5423,16 @@ function SaleForm({
         <span>Quick payment:</span>
         <button
           type="button"
-          onClick={() => setPaid(total.toFixed(2))}
+          onClick={() => setPaid(payableTotal.toFixed(2))}
           className="rounded-md border border-[#dfe6dc] bg-white px-2 py-1 font-semibold text-[#456c4e] hover:bg-[#f3f7f1]"
         >
           Full amount
         </button>
         <button
           type="button"
-          onClick={() => setPaid((Math.round(total * 50) / 100).toFixed(2))}
+          onClick={() =>
+            setPaid((Math.round(payableTotal * 50) / 100).toFixed(2))
+          }
           className="rounded-md border border-[#dfe6dc] bg-white px-2 py-1 font-semibold text-[#6b766d] hover:bg-[#f3f7f1]"
         >
           Half
@@ -4870,6 +5445,13 @@ function SaleForm({
           No payment
         </button>
       </div>
+      {advanceAvailable > 0 && (
+        <div className="rounded-lg border border-[#d8e8f2] bg-[#f4fafd] px-3 py-2 text-[11px] font-medium leading-4 text-sky-700">
+          {advanceApplied > 0
+            ? `${formatMoney(advanceApplied)} of this customer's advance will be used automatically. Collect only ${formatMoney(payableTotal)} in cash/UPI.`
+            : `This customer has ${formatMoney(advanceAvailable)} advance credit available for this sale.`}
+        </div>
+      )}
 
       <div>
         <p className="text-sm font-medium text-[#48574c]">Payment method</p>
@@ -4918,6 +5500,20 @@ function SaleForm({
           <span className="font-semibold">Net total</span>
           <span className="text-base font-bold">{formatMoney(total)}</span>
         </div>
+        {advanceApplied > 0 && (
+          <>
+            <div className="mt-2 flex items-center justify-between text-sky-700">
+              <span>Advance applied</span>
+              <span className="font-semibold">
+                − {formatMoney(advanceApplied)}
+              </span>
+            </div>
+            <div className="mt-2 flex items-center justify-between text-[#35483a]">
+              <span className="font-semibold">Amount payable</span>
+              <span className="font-bold">{formatMoney(payableTotal)}</span>
+            </div>
+          </>
+        )}
         <div className="mt-2 flex items-center justify-between text-[#6c796f]">
           <span>Paid now</span>
           <span className="font-semibold text-[#285d42]">
@@ -4932,12 +5528,14 @@ function SaleForm({
         )}
         <div className="mt-2 flex items-center justify-between border-t border-[#e7ede5] pt-2">
           <span className="text-[#6c796f]">
-            {Number(paid || 0) <= 0
-              ? "Full amount added to balance"
-              : balance > 0
-                ? "Remaining added to balance"
-                : overpaid > 0
-                  ? "Extra kept as customer advance"
+            {balance > 0
+              ? Number(paid || 0) <= 0
+                ? "Full amount added to balance"
+                : "Remaining added to balance"
+              : overpaid > 0
+                ? "Extra kept as customer advance"
+                : advanceApplied >= total && total > 0
+                  ? "Fully covered by customer advance"
                   : "Fully paid"}
           </span>
           <span className="font-semibold text-[#9a6133]">
@@ -4966,6 +5564,861 @@ function SaleForm({
 }
 
 
+function downloadCsv(
+  filename: string,
+  headers: string[],
+  rows: (string | number | null | undefined)[][],
+) {
+  const escape = (value: string | number | null | undefined) => {
+    const text = value == null ? "" : String(value);
+    return `"${text.replace(/"/g, '""')}"`;
+  };
+  const csv = [headers, ...rows]
+    .map((row) => row.map(escape).join(","))
+    .join("\r\n");
+  const blob = new Blob([`\uFEFF${csv}`], {
+    type: "text/csv;charset=utf-8;",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function PaymentsDueLedgerPage({
+  customers,
+  summary,
+  loading,
+  stale,
+  error,
+  onRefresh,
+  onReceivePayment,
+  onViewLedger,
+  onViewPurchases,
+  onReminder,
+  onOpeningBalance,
+}: {
+  customers: Customer[];
+  summary: CustomerSummaryResult | null;
+  loading: boolean;
+  stale: boolean;
+  error: string;
+  onRefresh: () => void;
+  onReceivePayment: (customer: Customer) => void;
+  onViewLedger: (customer: Customer) => void;
+  onViewPurchases: (customer: Customer) => void;
+  onReminder: (customer: Customer) => void;
+  onOpeningBalance: (customer?: Customer) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [status, setStatus] = useState<
+    "all" | "due" | "settled" | "advance"
+  >("due");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [sort, setSort] = useState<"outstanding" | "name" | "recent">(
+    "outstanding",
+  );
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, status, fromDate, toDate, sort, pageSize]);
+
+  const filtered = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return customers
+      .filter((customer) => {
+        if (
+          query &&
+          ![customer.name, customer.phone ?? "", customer.address ?? ""]
+            .join(" ")
+            .toLowerCase()
+            .includes(query)
+        ) {
+          return false;
+        }
+        const due = customer.pending_balance ?? 0;
+        const advance = customer.advance_balance ?? 0;
+        if (status === "due" && due <= 0) return false;
+        if (status === "advance" && advance <= 0) return false;
+        if (
+          status === "settled" &&
+          (due > 0 ||
+            advance > 0 ||
+            (customer.total_billed ?? 0) +
+              (customer.opening_balance ?? 0) +
+              (customer.total_paid ?? 0) <=
+              0)
+        ) {
+          return false;
+        }
+        const lastDate = customer.last_payment_date;
+        if (fromDate && (!lastDate || lastDate < fromDate)) return false;
+        if (toDate && (!lastDate || lastDate > toDate)) return false;
+        return true;
+      })
+      .sort((left, right) => {
+        if (sort === "name") return left.name.localeCompare(right.name);
+        if (sort === "recent") {
+          return (right.last_payment_date ?? "").localeCompare(
+            left.last_payment_date ?? "",
+          );
+        }
+        return (
+          (right.pending_balance ?? 0) - (left.pending_balance ?? 0) ||
+          left.name.localeCompare(right.name)
+        );
+      });
+  }, [customers, search, status, fromDate, toDate, sort]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const paginated = filtered.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
+  );
+  const dueTotal = filtered.reduce(
+    (sum, customer) => sum + (customer.pending_balance ?? 0),
+    0,
+  );
+  const advanceTotal = filtered.reduce(
+    (sum, customer) => sum + (customer.advance_balance ?? 0),
+    0,
+  );
+
+  const exportDues = () =>
+    downloadCsv(
+      `customer-dues-${today()}.csv`,
+      [
+        "Customer name",
+        "Phone",
+        "Opening balance",
+        "Total purchases",
+        "Total payments received",
+        "Advance adjustments",
+        "Outstanding due",
+        "Available advance",
+        "Last payment date",
+      ],
+      filtered.map((customer) => [
+        customer.name,
+        customer.phone,
+        customer.opening_balance,
+        customer.total_billed,
+        customer.total_paid,
+        customer.advance_adjustments,
+        customer.pending_balance,
+        customer.advance_balance,
+        customer.last_payment_date,
+      ]),
+    );
+
+  return (
+    <section className="mt-8 space-y-5">
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+        <SummaryCard
+          label="Total Outstanding Due"
+          value={formatMetric(summary?.outstanding, loading, stale)}
+          detail="All customers, including opening balances"
+          icon={<IndianRupee size={19} />}
+          accent="red"
+        />
+        <SummaryCard
+          label="Collected Today"
+          value={formatMetric(summary?.collectedToday, loading, stale)}
+          detail="Cash/UPI/bank payments received today"
+          icon={<Banknote size={19} />}
+          accent="emerald"
+        />
+        <SummaryCard
+          label="Collected This Month"
+          value={formatMetric(summary?.collectedThisMonth, loading, stale)}
+          detail="Sale-time plus standalone collections"
+          icon={<Calendar size={19} />}
+          accent="green"
+        />
+        <SummaryCard
+          label="Available Customer Advance"
+          value={formatMetric(summary?.totalAdvance, loading, stale)}
+          detail="Credit available for future purchases"
+          icon={<Wallet size={19} />}
+          accent="green"
+        />
+        <SummaryCard
+          label="Customers With Dues"
+          value={
+            loading
+              ? "Refreshing…"
+              : stale || summary?.dueCustomerCount == null
+                ? "Unavailable"
+                : summary.dueCustomerCount.toLocaleString("en-IN")
+          }
+          detail={`${filtered.length} customer${filtered.length === 1 ? "" : "s"} in this view`}
+          icon={<Users size={19} />}
+          accent="amber"
+        />
+      </div>
+
+      <div className="overflow-hidden rounded-2xl border border-[#e8ece5] bg-white shadow-[0_2px_8px_rgba(24,40,30,0.03)]">
+        <div className="flex flex-col gap-4 border-b border-[#eef0eb] px-5 py-4 xl:flex-row xl:items-start xl:justify-between">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-lg font-semibold tracking-[-0.025em] text-[#29382e]">
+                Customer-wise outstanding dues
+              </h3>
+              <span className="rounded-full bg-[#edf4eb] px-2 py-0.5 text-[10px] font-semibold text-[#456c4e]">
+                Live ledger balances
+              </span>
+            </div>
+            <p className="mt-1 max-w-2xl text-xs leading-5 text-[#838c85]">
+              Opening balances are previous dues, not sales. Payments settle
+              dues first; any excess becomes available advance. Advance
+              adjustments are shown separately and never counted as new cash.
+            </p>
+            <p className="mt-1 text-[11px] text-[#8d968e]">
+              Filtered totals: {formatMoney(dueTotal)} due ·{" "}
+              {formatMoney(advanceTotal)} advance
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className={secondaryButton}
+              onClick={onRefresh}
+              disabled={loading}
+            >
+              <RefreshCw size={15} className={loading ? "animate-spin" : ""} />
+              Refresh
+            </button>
+            <button
+              type="button"
+              className={secondaryButton}
+              onClick={exportDues}
+              disabled={filtered.length === 0}
+            >
+              <Download size={15} />
+              Export CSV
+            </button>
+            <button
+              type="button"
+              className={primaryButton}
+              onClick={() => onOpeningBalance()}
+            >
+              <Plus size={15} />
+              Opening balance
+            </button>
+          </div>
+        </div>
+
+        <div className="grid gap-3 border-b border-[#eef0eb] bg-[#fbfcfa] px-5 py-4 sm:grid-cols-2 xl:grid-cols-5">
+          <div className="relative xl:col-span-2">
+            <Search
+              size={16}
+              className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#959d96]"
+            />
+            <input
+              className="h-10 w-full rounded-xl border border-[#e4e8e1] bg-white pl-10 pr-3 text-sm outline-none placeholder:text-[#a0a79f] focus:border-[#9ab59e] focus:ring-2 focus:ring-[#e7f0e7]"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search customer name or phone…"
+            />
+          </div>
+          <select
+            className="h-10 rounded-xl border border-[#e4e8e1] bg-white px-3 text-xs font-medium text-[#526157] outline-none focus:border-[#9ab59e]"
+            value={status}
+            onChange={(event) =>
+              setStatus(
+                event.target.value as "all" | "due" | "settled" | "advance",
+              )
+            }
+          >
+            <option value="all">All balances</option>
+            <option value="due">Outstanding dues</option>
+            <option value="settled">Fully paid</option>
+            <option value="advance">Advance balance</option>
+          </select>
+          <select
+            className="h-10 rounded-xl border border-[#e4e8e1] bg-white px-3 text-xs font-medium text-[#526157] outline-none focus:border-[#9ab59e]"
+            value={sort}
+            onChange={(event) =>
+              setSort(
+                event.target.value as "outstanding" | "name" | "recent",
+              )
+            }
+          >
+            <option value="outstanding">Highest outstanding</option>
+            <option value="recent">Last payment (newest)</option>
+            <option value="name">Customer name</option>
+          </select>
+          <div>
+            <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-[#8d968e]">
+              Last payment date
+            </span>
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="date"
+                aria-label="Last payment from date"
+                className="h-10 min-w-0 rounded-xl border border-[#e4e8e1] bg-white px-2 text-[11px] text-[#526157] outline-none focus:border-[#9ab59e]"
+                value={fromDate}
+                onChange={(event) => setFromDate(event.target.value)}
+              />
+              <input
+                type="date"
+                aria-label="Last payment to date"
+                className="h-10 min-w-0 rounded-xl border border-[#e4e8e1] bg-white px-2 text-[11px] text-[#526157] outline-none focus:border-[#9ab59e]"
+                value={toDate}
+                onChange={(event) => setToDate(event.target.value)}
+              />
+            </div>
+          </div>
+        </div>
+
+        {error && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#f0d9d4] bg-[#fff6f3] px-5 py-3 text-xs text-[#a64836]">
+            <span>{error}</span>
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="font-semibold underline underline-offset-2"
+            >
+              Try again
+            </button>
+          </div>
+        )}
+        {summary?.warning && summary.warning !== error && (
+          <div className="border-b border-[#f0d9d4] bg-[#fff6f3] px-5 py-3 text-xs text-[#a64836]">
+            {summary.warning}
+          </div>
+        )}
+
+        {loading && !summary ? (
+          <div className="flex items-center justify-center gap-2 py-16 text-sm text-[#7c867e]">
+            <LoaderCircle size={17} className="animate-spin" />
+            Loading customer dues…
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="px-5 py-16 text-center">
+            <HandCoins className="mx-auto text-[#8ca18d]" size={26} />
+            <p className="mt-3 text-sm font-semibold text-[#405046]">
+              No customers match this view
+            </p>
+            <p className="mt-1 text-xs text-[#8a938c]">
+              Change the search, balance type, or payment date range.
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="hidden overflow-x-auto xl:block">
+              <table className="w-full min-w-[1180px] text-left text-xs">
+                <thead className="border-b border-[#eef0eb] bg-white text-[10px] font-semibold uppercase tracking-[0.1em] text-[#919a92]">
+                  <tr>
+                    <th className="px-5 py-3">Customer</th>
+                    <th className="px-3 py-3 text-right">Opening balance</th>
+                    <th className="px-3 py-3 text-right">Total purchases</th>
+                    <th className="px-3 py-3 text-right">Payments received</th>
+                    <th className="px-3 py-3 text-right">Advance used</th>
+                    <th className="px-3 py-3 text-right">Outstanding due</th>
+                    <th className="px-3 py-3 text-right">Available advance</th>
+                    <th className="px-3 py-3">Last payment</th>
+                    <th className="px-5 py-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#eef0eb]">
+                  {paginated.map((customer) => {
+                    const due = customer.pending_balance ?? 0;
+                    const advance = customer.advance_balance ?? 0;
+                    return (
+                      <tr key={customer.id} className="hover:bg-[#fafbf9]">
+                        <td className="px-5 py-3.5">
+                          <button
+                            type="button"
+                            className="text-left"
+                            onClick={() => onViewLedger(customer)}
+                          >
+                            <span className="block text-sm font-semibold text-[#29382e] hover:text-[#285d42]">
+                              {customer.name}
+                            </span>
+                            <span className="mt-0.5 block text-[11px] text-[#8e9891]">
+                              {customer.phone || "No phone saved"}
+                            </span>
+                          </button>
+                        </td>
+                        <td className="px-3 py-3.5 text-right">
+                          <button
+                            type="button"
+                            title="Set or correct opening balance"
+                            onClick={() => onOpeningBalance(customer)}
+                            className="rounded-md px-1.5 py-0.5 font-medium text-[#8b6139] hover:bg-[#f8f1e7]"
+                          >
+                            {formatMoney(customer.opening_balance ?? 0)}
+                          </button>
+                        </td>
+                        <td className="px-3 py-3.5 text-right font-medium text-[#405046]">
+                          {formatMoney(customer.total_billed ?? 0)}
+                        </td>
+                        <td className="px-3 py-3.5 text-right font-medium text-[#285d42]">
+                          {formatMoney(customer.total_paid ?? 0)}
+                        </td>
+                        <td className="px-3 py-3.5 text-right font-medium text-sky-700">
+                          {formatMoney(customer.advance_adjustments ?? 0)}
+                        </td>
+                        <td
+                          className={`px-3 py-3.5 text-right text-sm font-bold ${
+                            due > 0 ? "text-red-600" : "text-emerald-700"
+                          }`}
+                        >
+                          {formatMoney(due)}
+                        </td>
+                        <td
+                          className={`px-3 py-3.5 text-right text-sm font-bold ${
+                            advance > 0 ? "text-sky-700" : "text-[#8d968e]"
+                          }`}
+                        >
+                          {formatMoney(advance)}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-3.5 text-[11px] text-[#69766c]">
+                          {customer.last_payment_date
+                            ? formatDate(customer.last_payment_date)
+                            : "—"}
+                        </td>
+                        <td className="px-5 py-3.5">
+                          <div className="flex items-center justify-end gap-1">
+                            <button
+                              type="button"
+                              title="View customer ledger"
+                              aria-label={`View ${customer.name} ledger`}
+                              className="rounded-lg border border-[#e6eae4] bg-white p-1.5 text-[#627067] hover:bg-[#f3f6f1]"
+                              onClick={() => onViewLedger(customer)}
+                            >
+                              <Eye size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              title="Receive payment"
+                              aria-label={`Receive payment from ${customer.name}`}
+                              className="rounded-lg border border-[#d8e5d6] bg-[#f4f9f2] p-1.5 text-[#356347] hover:bg-[#eaf4e7]"
+                              onClick={() => onReceivePayment(customer)}
+                            >
+                              <Banknote size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              title="View purchase history"
+                              aria-label={`View ${customer.name} purchases`}
+                              className="rounded-lg border border-[#e6eae4] bg-white p-1.5 text-[#627067] hover:bg-[#f3f6f1]"
+                              onClick={() => onViewPurchases(customer)}
+                            >
+                              <ShoppingBag size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              title={
+                                due > 0
+                                  ? "Send WhatsApp payment reminder"
+                                  : "No outstanding due to remind"
+                              }
+                              aria-label={`WhatsApp reminder for ${customer.name}`}
+                              disabled={due <= 0}
+                              className="rounded-lg border border-[#d8e5d6] bg-white p-1.5 text-[#28734b] hover:bg-[#eef7ec] disabled:cursor-not-allowed disabled:opacity-40"
+                              onClick={() => onReminder(customer)}
+                            >
+                              <MessageCircle size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <ul className="divide-y divide-[#eef0eb] xl:hidden">
+              {paginated.map((customer) => {
+                const due = customer.pending_balance ?? 0;
+                const advance = customer.advance_balance ?? 0;
+                return (
+                  <li key={customer.id} className="px-4 py-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-[#29382e]">
+                          {customer.name}
+                        </p>
+                        <p className="mt-0.5 text-[11px] text-[#8e9891]">
+                          {customer.phone || "No phone saved"}
+                        </p>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <p
+                          className={`text-sm font-bold ${
+                            due > 0 ? "text-red-600" : "text-emerald-700"
+                          }`}
+                        >
+                          Due {formatMoney(due)}
+                        </p>
+                        {advance > 0 && (
+                          <p className="mt-0.5 text-[11px] font-semibold text-sky-700">
+                            + {formatMoney(advance)} advance
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-2 rounded-xl bg-[#f8faf7] p-2.5 text-[11px]">
+                      <div>
+                        <span className="block text-[10px] text-[#818d83]">
+                          Opening
+                        </span>
+                        <span className="font-semibold text-[#8b6139]">
+                          {formatMoney(customer.opening_balance ?? 0)}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span className="block text-[10px] text-[#818d83]">
+                          Purchases
+                        </span>
+                        <span className="font-semibold text-[#405046]">
+                          {formatMoney(customer.total_billed ?? 0)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="block text-[10px] text-[#818d83]">
+                          Payments received
+                        </span>
+                        <span className="font-semibold text-[#285d42]">
+                          {formatMoney(customer.total_paid ?? 0)}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span className="block text-[10px] text-[#818d83]">
+                          Advance used
+                        </span>
+                        <span className="font-semibold text-sky-700">
+                          {formatMoney(customer.advance_adjustments ?? 0)}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#7f8981]">
+                      <span>
+                        Last payment:{" "}
+                        {customer.last_payment_date
+                          ? formatDate(customer.last_payment_date)
+                          : "—"}
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          className="rounded-lg border border-[#e6eae4] bg-white px-2 py-1.5 font-semibold text-[#55645a]"
+                          onClick={() => onViewLedger(customer)}
+                        >
+                          Ledger
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-lg border border-[#d8e5d6] bg-[#f4f9f2] px-2 py-1.5 font-semibold text-[#356347]"
+                          onClick={() => onReceivePayment(customer)}
+                        >
+                          Pay
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-lg border border-[#e6eae4] bg-white p-1.5 text-[#627067]"
+                          title="View purchase history"
+                          onClick={() => onViewPurchases(customer)}
+                        >
+                          <ShoppingBag size={13} />
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-lg border border-[#d8e5d6] bg-white p-1.5 text-[#28734b] disabled:opacity-40"
+                          disabled={due <= 0}
+                          title="Send WhatsApp reminder"
+                          onClick={() => onReminder(customer)}
+                        >
+                          <MessageCircle size={13} />
+                        </button>
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#eef0eb] bg-[#fbfcfa] px-5 py-3 text-[11px] text-[#8d968e]">
+          <span>
+            Showing {filtered.length === 0 ? 0 : (currentPage - 1) * pageSize + 1}
+            –{Math.min(currentPage * pageSize, filtered.length)} of{" "}
+            {filtered.length} customers
+          </span>
+          <div className="flex items-center gap-2">
+            <select
+              className="h-8 rounded-lg border border-[#e2e6df] bg-white px-2 text-[11px]"
+              value={pageSize}
+              onChange={(event) => setPageSize(Number(event.target.value))}
+            >
+              <option value={10}>10 / page</option>
+              <option value={25}>25 / page</option>
+              <option value={50}>50 / page</option>
+            </select>
+            <button
+              type="button"
+              className={secondaryButton}
+              disabled={currentPage <= 1}
+              onClick={() => setPage((current) => Math.max(1, current - 1))}
+            >
+              Previous
+            </button>
+            <span className="font-semibold text-[#5b665e]">
+              {currentPage} / {pageCount}
+            </span>
+            <button
+              type="button"
+              className={secondaryButton}
+              disabled={currentPage >= pageCount}
+              onClick={() =>
+                setPage((current) => Math.min(pageCount, current + 1))
+              }
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function OpeningBalanceForm({
+  customers,
+  saving,
+  error,
+  onSubmit,
+  onCancel,
+  initialCustomerId,
+}: {
+  customers: Customer[];
+  saving: boolean;
+  error: string;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCancel: () => void;
+  initialCustomerId: string;
+}) {
+  const [customerId, setCustomerId] = useState(initialCustomerId);
+  const customer = customers.find((item) => item.id === customerId);
+  return (
+    <form onSubmit={onSubmit} className="space-y-4">
+      <div className="rounded-xl border border-[#f0e4d2] bg-[#fffaf2] px-3.5 py-3 text-[11px] leading-5 text-[#8a6137]">
+        Opening balance is for money owed from purchases made before this
+        system. It is recorded once per customer and is <strong>not</strong> a
+        sale or a new payment. Saving again corrects the existing opening
+        balance and keeps an audit trail.
+      </div>
+      <Field label="Customer" required>
+        <CustomerSelect
+          customers={customers}
+          selectedId={customerId}
+          onChange={setCustomerId}
+          includeBalances
+        />
+      </Field>
+      {customer && (
+        <div className="grid grid-cols-2 gap-3 rounded-xl bg-[#f6f8f4] px-3.5 py-3 text-xs">
+          <div>
+            <span className="block text-[10px] uppercase tracking-wider text-[#818d83]">
+              Existing opening
+            </span>
+            <span className="mt-1 block font-semibold text-[#8b6139]">
+              {formatOptionalMoney(customer.opening_balance)}
+            </span>
+          </div>
+          <div className="text-right">
+            <span className="block text-[10px] uppercase tracking-wider text-[#818d83]">
+              Current outstanding
+            </span>
+            <span className="mt-1 block font-semibold text-red-600">
+              {formatOptionalMoney(customer.pending_balance)}
+            </span>
+          </div>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Opening balance (₹)" required>
+          <input
+            key={customerId}
+            className={inputClass}
+            name="amount"
+            type="number"
+            min="0"
+            step="0.01"
+            required
+            defaultValue={customer?.opening_balance ?? ""}
+            placeholder="0.00"
+          />
+        </Field>
+        <Field label="Effective date" required>
+          <input
+            className={inputClass}
+            name="effectiveDate"
+            type="date"
+            required
+            defaultValue={today()}
+          />
+        </Field>
+      </div>
+      <Field label="Notes / reason">
+        <input
+          className={inputClass}
+          name="notes"
+          maxLength={500}
+          defaultValue=""
+          placeholder="Example: Dues carried forward from old notebook"
+        />
+      </Field>
+      <FormError message={error} />
+      <ModalActions
+        onCancel={onCancel}
+        saving={saving}
+        submitLabel="Save opening balance"
+      />
+    </form>
+  );
+}
+
+function ReminderModal({
+  customer,
+  onClose,
+}: {
+  customer: Customer;
+  onClose: () => void;
+}) {
+  const phone = safeWhatsAppPhone(customer.phone);
+  const due = Math.max(0, customer.pending_balance ?? 0);
+  const [language, setLanguage] = useState<"ta" | "en">(() => {
+    if (typeof window === "undefined") return "ta";
+    return window.localStorage.getItem("reminder-language") === "en"
+      ? "en"
+      : "ta";
+  });
+  const defaultMessage =
+    language === "ta"
+      ? `Vanakkam ${customer.name},\n\nUngal Karumbu Sakkarai account-la ${formatMoney(due)} pending balance irukku.\n\nUngalukku vasadhiyaana nerathula payment settle pannunga.\n\nThank you!`
+      : `Hello ${customer.name},\n\nYour Karumbu Sakkarai account has a pending balance of ${formatMoney(due)}.\n\nPlease settle the payment at your convenience.\n\nThank you!`;
+  const [message, setMessage] = useState(defaultMessage);
+
+  function changeLanguage(next: "ta" | "en") {
+    setLanguage(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("reminder-language", next);
+    }
+    setMessage(
+      next === "ta"
+        ? `Vanakkam ${customer.name},\n\nUngal Karumbu Sakkarai account-la ${formatMoney(due)} pending balance irukku.\n\nUngalukku vasadhiyaana nerathula payment settle pannunga.\n\nThank you!`
+        : `Hello ${customer.name},\n\nYour Karumbu Sakkarai account has a pending balance of ${formatMoney(due)}.\n\nPlease settle the payment at your convenience.\n\nThank you!`,
+    );
+  }
+
+  const whatsappHref = phone
+    ? `https://wa.me/${phone}?text=${encodeURIComponent(message)}`
+    : null;
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-[#e4e9e1] bg-[#f8faf7] p-4 text-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="font-semibold text-[#29382e]">{customer.name}</p>
+            <p className="mt-0.5 text-xs text-[#7f8981]">
+              {customer.phone || "No phone number saved"}
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="text-[10px] uppercase tracking-wider text-[#818d83]">
+              Outstanding due
+            </p>
+            <p className="mt-0.5 font-bold text-red-600">{formatMoney(due)}</p>
+          </div>
+        </div>
+      </div>
+      {due <= 0 && (
+        <ErrorNotice>
+          This customer has no outstanding due. Payment reminders are only
+          available when an amount is pending.
+        </ErrorNotice>
+      )}
+      {!phone && (
+        <ErrorNotice>
+          Add a valid phone number to this customer before creating a WhatsApp
+          reminder.
+        </ErrorNotice>
+      )}
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm font-medium text-[#48574c]">Reminder language</p>
+        <div className="flex rounded-xl border border-[#e2e6df] bg-white p-1">
+          {(
+            [
+              ["ta", "தமிழ்"],
+              ["en", "English"],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => changeLanguage(value)}
+              className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
+                language === value
+                  ? "bg-[#edf4eb] text-[#285d42]"
+                  : "text-[#717b74]"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <Field label="Message (edit before opening WhatsApp)">
+        <textarea
+          className={`${inputClass} h-40 resize-none py-3`}
+          value={message}
+          onChange={(event) => setMessage(event.target.value)}
+          maxLength={1200}
+        />
+      </Field>
+      <p className="rounded-lg border border-dashed border-[#dce5da] bg-[#fbfcfa] px-3 py-2 text-[11px] leading-4 text-[#77857a]">
+        This opens WhatsApp with a prepared message. Nothing is sent
+        automatically — review the message and press send inside WhatsApp.
+      </p>
+      <div className="flex flex-col-reverse gap-2 border-t border-[#eef0eb] pt-4 sm:flex-row sm:justify-end">
+        <button type="button" className={secondaryButton} onClick={onClose}>
+          Close
+        </button>
+        {whatsappHref && due > 0 ? (
+          <a
+            href={whatsappHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={primaryButton}
+          >
+            <MessageCircle size={15} />
+            Open WhatsApp
+          </a>
+        ) : (
+          <button type="button" className={primaryButton} disabled>
+            <MessageCircle size={15} />
+            Open WhatsApp
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function PaymentForm({
   customers,
   saving,
@@ -4981,65 +6434,171 @@ function PaymentForm({
   onCancel: () => void;
   initialCustomerId: string;
 }) {
-  const eligibleCustomers = customers.filter(
-    (item) => item.pending_balance !== null && item.pending_balance > 0,
-  );
-  const balancesUnavailable = customers.some(
-    (item) => item.pending_balance === null,
-  );
   const [customerId, setCustomerId] = useState(initialCustomerId);
+  const [amount, setAmount] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("cash");
   const customer = customers.find((item) => item.id === customerId);
+  const pendingDue = Math.max(0, customer?.pending_balance ?? 0);
+  const currentAdvance = Math.max(0, customer?.advance_balance ?? 0);
+  const paymentAmount = Math.max(0, Number(amount || 0));
+  const appliedToDue = Math.min(paymentAmount, pendingDue);
+  const remainingDue = Math.max(0, pendingDue - paymentAmount);
+  const advanceAdded =
+    Math.round(Math.max(0, paymentAmount - pendingDue) * 100) / 100;
+  const advanceAfter = currentAdvance + advanceAdded;
 
   return (
     <form onSubmit={onSubmit} className="space-y-4">
-      {eligibleCustomers.length === 0 && (
-        <ErrorNotice>
-          {customers.length === 0
-            ? "Add a customer before recording a payment."
-            : balancesUnavailable
-              ? "Customer balances are unavailable. Refresh the dashboard before recording a payment."
-              : "There are no customers with pending dues."}
-        </ErrorNotice>
+      {customers.length === 0 && (
+        <ErrorNotice>Add a customer before recording a payment.</ErrorNotice>
       )}
       <Field label="Customer" required>
         <CustomerSelect
-          customers={eligibleCustomers}
+          customers={customers}
           selectedId={customerId}
           onChange={setCustomerId}
           includeBalances
         />
       </Field>
       {customer && (
-        <div className="flex items-center justify-between rounded-xl bg-[#f6f8f4] px-3.5 py-3 text-sm">
-          <span className="text-[#748077]">Current pending balance</span>
-          <span className="font-semibold text-[#8b6139]">
-            {formatOptionalMoney(customer.pending_balance)}
-          </span>
+        <div className="space-y-2 rounded-xl bg-[#f6f8f4] px-3.5 py-3 text-sm">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[#748077]">Customer</span>
+            <span className="font-semibold text-[#405046]">
+              {customer.name}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-3 border-t border-[#e5eae2] pt-2">
+            <span className="text-[#748077]">Phone</span>
+            <span className="font-medium text-[#59685d]">
+              {customer.phone || "Not saved"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-3 border-t border-[#e5eae2] pt-2">
+            <span className="text-[#748077]">Current outstanding due</span>
+            <span className="font-semibold text-[#8b6139]">
+              {formatOptionalMoney(customer.pending_balance)}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-3 border-t border-[#e5eae2] pt-2">
+            <span className="text-[#748077]">Current available advance</span>
+            <span className="font-semibold text-sky-700">
+              {formatMoney(currentAdvance)}
+            </span>
+          </div>
         </div>
       )}
       <div className="grid grid-cols-2 gap-3">
-        <Field label="Payment date" required>
+        <Field label="Payment date & time" required>
           <input
             className={inputClass}
-            type="date"
-            name="paymentDate"
-            defaultValue={today()}
+            type="datetime-local"
+            name="paidAt"
+            defaultValue={localDateTimeInputValue()}
             required
           />
         </Field>
-        <Field label="Amount (₹)" required>
+        <Field label="Payment amount (₹)" required>
           <input
             className={inputClass}
             type="number"
             name="amount"
             min="0.01"
-            max={customer?.pending_balance ?? undefined}
             step="0.01"
             required
+            value={amount}
+            onChange={(event) => setAmount(event.target.value)}
             placeholder="0.00"
           />
         </Field>
       </div>
+      <div>
+        <p className="text-sm font-medium text-[#48574c]">Payment method</p>
+        <div className="mt-1.5 grid grid-cols-2 gap-2">
+          {(
+            [
+              ["cash", "Cash"],
+              ["upi", "UPI"],
+              ["bank", "Bank transfer"],
+              ["other", "Other"],
+            ] as const
+          ).map(([method, label]) => {
+            const active = paymentMethod === method;
+            return (
+              <button
+                key={method}
+                type="button"
+                aria-pressed={active}
+                onClick={() => setPaymentMethod(method)}
+                className={`flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition ${
+                  active
+                    ? "border-[#8eae94] bg-[#edf4eb] text-[#285d42] ring-2 ring-[#e7f0e7]"
+                    : "border-[#e2e6df] bg-white text-[#6c796f] hover:bg-[#f7f9f5]"
+                }`}
+              >
+                {method === "cash" ? (
+                  <Banknote size={15} />
+                ) : method === "upi" ? (
+                  <IndianRupee size={15} />
+                ) : (
+                  <HandCoins size={15} />
+                )}
+                {label}
+              </button>
+            );
+          })}
+        </div>
+        <input type="hidden" name="paymentMethod" value={paymentMethod} />
+      </div>
+      <Field label="Reference / transaction ID">
+        <input
+          className={inputClass}
+          name="reference"
+          maxLength={160}
+          placeholder="UPI reference, bank reference, receipt number (optional)"
+        />
+      </Field>
+      <div className="rounded-xl border border-[#e8eee6] bg-[#f7faf6] p-4 text-sm">
+        <div className="flex items-center justify-between text-[#6c796f]">
+          <span>Payment received</span>
+          <span className="font-semibold text-[#285d42]">
+            {formatMoney(paymentAmount)}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center justify-between text-[#6c796f]">
+          <span>Applied to outstanding due</span>
+          <span className="font-semibold text-[#8b6139]">
+            {formatMoney(appliedToDue)}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center justify-between text-[#6c796f]">
+          <span>Remaining due after payment</span>
+          <span
+            className={`font-semibold ${
+              remainingDue > 0 ? "text-red-600" : "text-emerald-700"
+            }`}
+          >
+            {formatMoney(remainingDue)}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center justify-between border-t border-[#e7ede5] pt-2 text-[#6c796f]">
+          <span>Added to advance</span>
+          <span className="font-semibold text-sky-700">
+            {formatMoney(advanceAdded)}
+          </span>
+        </div>
+        <div className="mt-1 flex items-center justify-between text-[#6c796f]">
+          <span>Advance balance after payment</span>
+          <span className="font-semibold text-sky-700">
+            {formatMoney(advanceAfter)}
+          </span>
+        </div>
+      </div>
+      <p className="rounded-lg border border-dashed border-[#dce5da] bg-[#fbfcfa] px-3 py-2 text-[11px] leading-4 text-[#77857a]">
+        Payments settle outstanding dues first. Any excess is saved as customer
+        advance and automatically adjusted on the next sale. A payment does not
+        create a sale.
+      </p>
       <Field label="Notes">
         <input
           className={inputClass}
@@ -5049,7 +6608,11 @@ function PaymentForm({
         />
       </Field>
       <FormError message={error} />
-      <ModalActions onCancel={onCancel} saving={saving} submitLabel="Save payment" />
+      <ModalActions
+        onCancel={onCancel}
+        saving={saving}
+        submitLabel="Save payment"
+      />
     </form>
   );
 }
@@ -5059,25 +6622,29 @@ function LedgerView({
   entries,
   loading,
   error,
+  initialKind,
   onReceivePayment,
+  onReminder,
 }: {
   customer: Customer;
   entries: LedgerEntry[];
   loading: boolean;
   error: string;
+  initialKind: "all" | "sale" | "payment" | "opening";
   onReceivePayment: () => void;
+  onReminder: () => void;
 }) {
-  const phoneDigits = (customer.phone ?? "").replace(/\D/g, "");
-  const whatsappPhone =
-    phoneDigits.length === 10
-      ? `91${phoneDigits}`
-      : phoneDigits.startsWith("0") && phoneDigits.length === 11
-        ? `91${phoneDigits.slice(1)}`
-        : phoneDigits;
-  const whatsappMessage = `Hello ${customer.name}, your pending balance for Karumbu Sakkarai is ${formatOptionalMoney(customer.pending_balance)}. Please let us know when convenient. Thank you.`;
-  const whatsappHref = whatsappPhone && customer.pending_balance !== null
-    ? `https://wa.me/${whatsappPhone}?text=${encodeURIComponent(whatsappMessage)}`
-    : null;
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [kindFilter, setKindFilter] = useState<
+    "all" | "sale" | "payment" | "opening"
+  >(initialKind);
+  const [methodFilter, setMethodFilter] = useState<"all" | PaymentMethod>("all");
+  const [search, setSearch] = useState("");
+  const hasAdvance =
+    customer.advance_balance !== null && customer.advance_balance > 0;
+  const hasDue =
+    customer.pending_balance !== null && customer.pending_balance > 0;
   const balancesById = new Map<string, number>();
   const chronological = [...entries].reverse();
   let runningBalance = 0;
@@ -5086,60 +6653,271 @@ function LedgerView({
     balancesById.set(`${entry.kind}-${entry.id}`, runningBalance);
   }
 
+  const filteredEntries = entries.filter((entry) => {
+    if (kindFilter !== "all" && entry.kind !== kindFilter) return false;
+    if (methodFilter !== "all" && entry.payment_method !== methodFilter) {
+      return false;
+    }
+    if (fromDate && entry.date < fromDate) return false;
+    if (toDate && entry.date > toDate) return false;
+    const query = search.trim().toLowerCase();
+    if (
+      query &&
+      ![
+        entry.description,
+        entry.reference ?? "",
+        entry.id,
+        customer.name,
+        entry.payment_method ? paymentMethodLabel(entry.payment_method) : "",
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(query)
+    ) {
+      return false;
+    }
+    return true;
+  });
+
+  const entryTypeLabel = (entry: LedgerEntry) => {
+    if (entry.kind === "opening") return "Opening balance";
+    if (entry.kind === "sale") {
+      if (entry.credit_applied > 0) return "Advance adjusted against sale";
+      if (entry.overpaid_amount > 0) return "Advance received";
+      if (entry.credit >= entry.debit) return "Full payment";
+      if (entry.credit > 0) return "Partial payment";
+      return "Sale";
+    }
+    return "Payment received";
+  };
+
+  const entryTime = (entry: LedgerEntry) =>
+    new Intl.DateTimeFormat("en-IN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(entry.paid_at));
+
+  const exportLedger = () =>
+    downloadCsv(
+      `ledger-${customer.name.replace(/[^a-z0-9]+/gi, "-")}-${today()}.csv`,
+      [
+        "Date",
+        "Time",
+        "Transaction ID",
+        "Transaction type",
+        "Description",
+        "Sale / payment reference",
+        "Payment method",
+        "Debit",
+        "Credit",
+        "Running balance",
+      ],
+      filteredEntries.map((entry) => [
+        entry.date,
+        entryTime(entry),
+        entry.id,
+        entryTypeLabel(entry),
+        entry.description,
+        entry.kind === "sale" ? entry.id : entry.reference,
+        entry.payment_method ? paymentMethodLabel(entry.payment_method) : "",
+        entry.debit || "",
+        entry.credit || "",
+        balancesById.get(`${entry.kind}-${entry.id}`) ?? 0,
+      ]),
+    );
+
+  const printLedger = () => {
+    const printWindow = window.open("", "_blank", "width=900,height=720");
+    if (!printWindow) return;
+    const rows = filteredEntries
+      .map((entry) => {
+        const balance = balancesById.get(`${entry.kind}-${entry.id}`) ?? 0;
+        return `<tr>
+          <td>${escapeHtml(formatDate(entry.date))}<br><span class="muted">${escapeHtml(entryTime(entry))}</span></td>
+          <td>${escapeHtml(entryTypeLabel(entry))}<br><span class="muted">${escapeHtml(entry.description)}</span></td>
+          <td>${escapeHtml(entry.reference || (entry.kind === "sale" ? entry.id.slice(0, 8) : "—"))}</td>
+          <td>${entry.payment_method ? escapeHtml(paymentMethodLabel(entry.payment_method)) : "—"}</td>
+          <td class="num">${entry.debit ? escapeHtml(formatMoney(entry.debit)) : "—"}</td>
+          <td class="num">${entry.credit ? escapeHtml(formatMoney(entry.credit)) : "—"}</td>
+          <td class="num strong ${balance > 0 ? "due" : balance < 0 ? "advance" : ""}">${escapeHtml(formatSignedBalance(balance))}</td>
+        </tr>`;
+      })
+      .join("");
+    printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Ledger - ${escapeHtml(customer.name)}</title>
+      <style>
+        body{font-family:Arial,sans-serif;color:#25372c;padding:24px;font-size:12px}
+        h1{font-size:20px;margin:0}.muted{color:#7f8981;font-size:10px}
+        .meta{color:#68756b;margin:4px 0 16px}.sum{margin:12px 0;font-weight:700}
+        table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #e3e8df;padding:7px 6px;text-align:left;vertical-align:top}
+        th{background:#f5f8f3;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#68756b}
+        .num{text-align:right}.strong{font-weight:700}.due{color:#b43d2f}.advance{color:#1d76a5}
+        .legend{margin-top:14px;color:#68756b;font-size:10px}.print{margin-top:18px;font-size:11px}
+        @media print{button{display:none}}
+      </style></head><body>
+      <h1>Karumbu Sakkarai · Customer Ledger</h1>
+      <div class="meta">${escapeHtml(customer.name)} · ${escapeHtml(customer.phone || "No phone")} · Generated ${escapeHtml(new Date().toLocaleString("en-IN"))}</div>
+      <div class="sum">Outstanding due: ${escapeHtml(formatMoney(customer.pending_balance ?? 0))} &nbsp; | &nbsp; Available advance: ${escapeHtml(formatMoney(customer.advance_balance ?? 0))}</div>
+      <table><thead><tr><th>Date</th><th>Transaction</th><th>Reference</th><th>Method</th><th class="num">Debit</th><th class="num">Credit</th><th class="num">Running balance</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="legend">Debit increases what the customer owes. Credit reduces dues first and then becomes advance. Balance shows − for due and + for advance.</div>
+      <div class="print"><button onclick="window.print()">Print this ledger</button></div>
+      </body></html>`);
+    printWindow.document.close();
+    printWindow.focus();
+  };
+
+  const totalDebit = filteredEntries.reduce((sum, entry) => sum + entry.debit, 0);
+  const totalCredit = filteredEntries.reduce((sum, entry) => sum + entry.credit, 0);
+
   return (
     <div>
-      <div className="mb-5 flex items-center justify-between rounded-2xl bg-[#f5f8f3] p-4">
+      <div className="mb-5 flex flex-col justify-between gap-4 rounded-2xl bg-[#f5f8f3] p-4 sm:flex-row sm:items-center">
         <div className="flex min-w-0 items-center gap-3">
           <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-white text-sm font-semibold text-[#52755a] shadow-sm">
             {customer.name.trim().charAt(0).toUpperCase()}
           </span>
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-[#2d3d32]">{customer.name}</p>
+            <p className="truncate text-sm font-semibold text-[#2d3d32]">
+              {customer.name}
+            </p>
             <p className="mt-0.5 truncate text-xs text-[#849087]">
               {customer.phone || customer.address || "Customer account"}
             </p>
           </div>
         </div>
-        <div className="pl-2 text-right">
-          <p className="text-[10px] font-medium uppercase tracking-[0.12em] text-[#849087]">
-            Pending
-          </p>
-          <p className="mt-1 text-sm font-semibold text-red-600">
-            {formatOptionalMoney(customer.pending_balance)}
-          </p>
+        <div className="flex shrink-0 gap-5 text-right">
+          <div>
+            <p className="text-[10px] font-medium uppercase tracking-[0.12em] text-[#849087]">
+              Due
+            </p>
+            <p className={`mt-1 text-sm font-bold ${hasDue ? "text-red-600" : "text-emerald-700"}`}>
+              {formatMoney(customer.pending_balance ?? 0)}
+            </p>
+          </div>
+          <div>
+            <p className="text-[10px] font-medium uppercase tracking-[0.12em] text-[#849087]">
+              Advance
+            </p>
+            <p className={`mt-1 text-sm font-bold ${hasAdvance ? "text-sky-700" : "text-[#8d968e]"}`}>
+              {formatMoney(customer.advance_balance ?? 0)}
+            </p>
+          </div>
         </div>
       </div>
-      <div className="mb-5 flex flex-wrap gap-2">
+
+      <div className="mb-4 flex flex-wrap gap-2">
         <button
           type="button"
           className={primaryButton}
-          disabled={
-            customer.pending_balance === null || customer.pending_balance <= 0
-          }
+          disabled={customer.pending_balance === null}
           onClick={onReceivePayment}
         >
           <Banknote size={16} />
-          Receive due payment
+          Receive payment / advance
         </button>
-        {whatsappHref ? (
-          <a
-            className={`${secondaryButton} text-[#28734b]`}
-            href={whatsappHref}
-            target="_blank"
-            rel="noopener noreferrer"
+        <button
+          type="button"
+          className={`${secondaryButton} text-[#28734b]`}
+          disabled={!hasDue || !safeWhatsAppPhone(customer.phone)}
+          title={
+            hasDue
+              ? "Review and open WhatsApp reminder"
+              : "No outstanding due to remind"
+          }
+          onClick={onReminder}
+        >
+          <MessageCircle size={16} />
+          WhatsApp reminder
+        </button>
+        <button
+          type="button"
+          className={secondaryButton}
+          onClick={printLedger}
+          disabled={filteredEntries.length === 0}
+        >
+          <Printer size={16} />
+          Print
+        </button>
+        <button
+          type="button"
+          className={secondaryButton}
+          onClick={exportLedger}
+          disabled={filteredEntries.length === 0}
+        >
+          <Download size={16} />
+          Export CSV
+        </button>
+      </div>
+
+      <div className="mb-4 grid gap-2 rounded-xl border border-[#e8ece5] bg-[#fbfcfa] p-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="relative lg:col-span-2">
+          <Search
+            size={14}
+            className="absolute left-3 top-1/2 -translate-y-1/2 text-[#959d96]"
+          />
+          <input
+            className="h-9 w-full rounded-lg border border-[#e2e6df] bg-white pl-8 pr-3 text-xs outline-none focus:border-[#9ab59e]"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search reference, description, or transaction ID…"
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <input
+            type="date"
+            aria-label="Ledger from date"
+            className="h-9 min-w-0 rounded-lg border border-[#e2e6df] bg-white px-2 text-[11px] text-[#526157]"
+            value={fromDate}
+            onChange={(event) => setFromDate(event.target.value)}
+          />
+          <input
+            type="date"
+            aria-label="Ledger to date"
+            className="h-9 min-w-0 rounded-lg border border-[#e2e6df] bg-white px-2 text-[11px] text-[#526157]"
+            value={toDate}
+            onChange={(event) => setToDate(event.target.value)}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <select
+            className="h-9 rounded-lg border border-[#e2e6df] bg-white px-2 text-[11px] text-[#526157]"
+            value={kindFilter}
+            onChange={(event) =>
+              setKindFilter(
+                event.target.value as "all" | "sale" | "payment" | "opening",
+              )
+            }
           >
-            <MessageCircle size={16} />
-            WhatsApp reminder
-          </a>
-        ) : (
-          <button type="button" className={secondaryButton} disabled title="Add a phone number to this customer to send a WhatsApp reminder.">
-            <MessageCircle size={16} />
-            WhatsApp unavailable
-          </button>
-        )}
+            <option value="all">All types</option>
+            <option value="sale">Sales</option>
+            <option value="payment">Payments</option>
+            <option value="opening">Opening balance</option>
+          </select>
+          <select
+            className="h-9 rounded-lg border border-[#e2e6df] bg-white px-2 text-[11px] text-[#526157]"
+            value={methodFilter}
+            onChange={(event) =>
+              setMethodFilter(event.target.value as "all" | PaymentMethod)
+            }
+          >
+            <option value="all">All methods</option>
+            <option value="cash">Cash</option>
+            <option value="upi">UPI</option>
+            <option value="bank">Bank transfer</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
       </div>
 
       <FormError message={error} />
+      <p className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-[#7f8981]">
+        <span>Debit = amount added to due</span>
+        <span className="text-[#c2c9c1]">·</span>
+        <span>Credit = payment received</span>
+        <span className="text-[#c2c9c1]">·</span>
+        <span><strong className="text-red-600">−</strong> due balance</span>
+        <span className="text-[#c2c9c1]">·</span>
+        <span><strong className="text-sky-700">+</strong> advance balance</span>
+      </p>
       {loading ? (
         <div className="flex items-center justify-center gap-2 py-12 text-sm text-[#7c867e]">
           <LoaderCircle size={17} className="animate-spin" />
@@ -5148,13 +6926,26 @@ function LedgerView({
       ) : entries.length === 0 ? (
         <div className="rounded-xl border border-dashed border-[#dfe5dc] px-4 py-10 text-center">
           <ShoppingBag className="mx-auto text-[#8ca18d]" size={22} />
-          <p className="mt-3 text-sm font-semibold text-[#405046]">No transactions yet</p>
+          <p className="mt-3 text-sm font-semibold text-[#405046]">
+            No transactions yet
+          </p>
           <p className="mt-1 text-xs text-[#8a938c]">
-            Sales and payments for this customer will appear here.
+            Sales, opening balances, and payments for this customer will appear
+            here.
+          </p>
+        </div>
+      ) : filteredEntries.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-[#dfe5dc] px-4 py-10 text-center">
+          <Search className="mx-auto text-[#8ca18d]" size={22} />
+          <p className="mt-3 text-sm font-semibold text-[#405046]">
+            No transactions match these filters
+          </p>
+          <p className="mt-1 text-xs text-[#8a938c]">
+            Clear the date, type, method, or search filters.
           </p>
         </div>
       ) : (
-        <div className="max-h-[430px] overflow-auto">
+        <div className="max-h-[460px] overflow-auto">
           <div className="grid grid-cols-[minmax(0,1fr)_88px] gap-3 border-b border-[#eef0eb] pb-2 text-[10px] font-semibold uppercase tracking-[0.13em] text-[#929b93] sm:grid-cols-[100px_minmax(0,1fr)_80px_90px_100px]">
             <span>Date</span>
             <span>Transaction</span>
@@ -5163,55 +6954,95 @@ function LedgerView({
             <span className="text-right">Balance</span>
           </div>
           <div className="divide-y divide-[#f0f1ed]">
-            {entries.map((entry) => (
-              <div
-                key={`${entry.kind}-${entry.id}`}
-                className="grid grid-cols-[minmax(0,1fr)_88px] items-center gap-3 py-3.5 sm:grid-cols-[100px_minmax(0,1fr)_80px_90px_100px]"
-              >
-                <span className="text-xs text-[#7f8981]">{formatDate(entry.date)}</span>
-                <span className="flex min-w-0 items-start gap-2">
+            {filteredEntries.map((entry) => {
+              const balance = balancesById.get(`${entry.kind}-${entry.id}`) ?? 0;
+              return (
+                <div
+                  key={`${entry.kind}-${entry.id}`}
+                  className="grid grid-cols-[minmax(0,1fr)_88px] items-center gap-3 py-3.5 sm:grid-cols-[100px_minmax(0,1fr)_80px_90px_100px]"
+                >
+                  <span className="text-xs text-[#7f8981]">
+                    {formatDate(entry.date)}
+                    <span className="mt-0.5 block text-[10px] text-[#a0a79f]">
+                      {entryTime(entry)}
+                    </span>
+                  </span>
+                  <span className="flex min-w-0 items-start gap-2">
+                    <span
+                      className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg ${
+                        entry.kind === "sale"
+                          ? "bg-[#f7efe4] text-[#a27643]"
+                          : entry.kind === "opening"
+                            ? "bg-[#f3f0e8] text-[#8b6139]"
+                            : "bg-[#edf4eb] text-[#5e8063]"
+                      }`}
+                    >
+                      {entry.kind === "sale" ? (
+                        <ArrowUpRight size={13} />
+                      ) : entry.kind === "opening" ? (
+                        <BookOpen size={13} />
+                      ) : (
+                        <ArrowDownLeft size={13} />
+                      )}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs font-medium text-[#465449]">
+                        {entryTypeLabel(entry)}
+                      </span>
+                      <span className="mt-0.5 block truncate text-[10px] text-[#929b93]">
+                        {entry.description}
+                      </span>
+                      <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-[#929b93]">
+                        <span className="rounded bg-[#f3f5f1] px-1.5 py-0.5">
+                          {entry.payment_method
+                            ? paymentMethodLabel(entry.payment_method)
+                            : "Ledger"}
+                        </span>
+                        <span title={entry.id}>
+                          ID: {entry.id.slice(0, 8).toUpperCase()}
+                        </span>
+                        {entry.reference && (
+                          <span className="truncate">Ref: {entry.reference}</span>
+                        )}
+                        {entry.kind === "sale" && ledgerAdvanceNote(entry) && (
+                          <span className="font-medium text-sky-700">
+                            {ledgerAdvanceNote(entry)}
+                          </span>
+                        )}
+                      </span>
+                      <span className="mt-0.5 block text-[10px] text-[#929b93] sm:hidden">
+                        {entry.debit
+                          ? `Debit ${formatMoney(entry.debit)}`
+                          : `Credit ${formatMoney(entry.credit)}`}
+                      </span>
+                    </span>
+                  </span>
+                  <span className="hidden text-right text-xs text-[#59685d] sm:block">
+                    {entry.debit ? formatMoney(entry.debit) : "—"}
+                  </span>
+                  <span className="hidden text-right text-xs text-[#59685d] sm:block">
+                    {entry.credit ? formatMoney(entry.credit) : "—"}
+                  </span>
                   <span
-                    className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg ${
-                      entry.kind === "sale"
-                        ? "bg-[#f7efe4] text-[#a27643]"
-                        : "bg-[#edf4eb] text-[#5e8063]"
+                    className={`text-right text-xs font-semibold ${
+                      balance > 0
+                        ? "text-red-600"
+                        : balance < 0
+                          ? "text-sky-700"
+                          : "text-[#59685d]"
                     }`}
                   >
-                    {entry.kind === "sale" ? (
-                      <ArrowUpRight size={13} />
-                    ) : (
-                      <ArrowDownLeft size={13} />
-                    )}
+                    {formatSignedBalance(balance)}
                   </span>
-                  <span className="min-w-0">
-                    <span className="block truncate text-xs font-medium text-[#465449]">
-                      {entry.description}
-                    </span>
-                    {entry.kind === "sale" && (
-                      <span className="mt-0.5 block text-[10px] text-[#929b93]">
-                        {entry.sale_unit === "bulk"
-                          ? `${entry.sale_quantity} kg × ${formatMoney(entry.rate_per_unit)}/kg`
-                          : `${entry.sale_quantity} × ${entry.sale_unit} @ ${formatMoney(entry.rate_per_unit)}`}
-                      </span>
-                    )}
-                    <span className="mt-0.5 block text-[10px] text-[#929b93] sm:hidden">
-                      {entry.kind === "sale"
-                        ? `Debit ${formatMoney(entry.debit)} · Paid ${formatMoney(entry.credit)}`
-                        : `Credit ${formatMoney(entry.credit)}`}
-                    </span>
-                  </span>
-                </span>
-                <span className="hidden text-right text-xs text-[#59685d] sm:block">
-                  {entry.debit ? formatMoney(entry.debit) : "—"}
-                </span>
-                <span className="hidden text-right text-xs text-[#59685d] sm:block">
-                  {entry.credit ? formatMoney(entry.credit) : "—"}
-                </span>
-                <span className="text-right text-xs font-semibold text-[#59685d]">
-                  {formatMoney(balancesById.get(`${entry.kind}-${entry.id}`) ?? 0)}
-                </span>
-              </div>
-            ))}
+                </div>
+              );
+            })}
+          </div>
+          <div className="sticky bottom-0 flex flex-wrap items-center justify-between gap-2 border-t border-[#e5e9e2] bg-[#f8faf7] px-2 py-2.5 text-[11px] font-semibold text-[#59685d]">
+            <span>{filteredEntries.length} transactions in this view</span>
+            <span>
+              Debit {formatMoney(totalDebit)} · Credit {formatMoney(totalCredit)}
+            </span>
           </div>
         </div>
       )}

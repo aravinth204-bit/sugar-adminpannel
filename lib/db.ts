@@ -36,6 +36,10 @@ export async function createCustomer(input: {
     total_billed: null,
     total_paid: null,
     pending_balance: null,
+    advance_balance: null,
+    opening_balance: null,
+    advance_adjustments: null,
+    last_payment_date: null,
   };
 }
 
@@ -65,6 +69,10 @@ export async function editCustomer(input: {
     total_billed: null,
     total_paid: null,
     pending_balance: null,
+    advance_balance: null,
+    opening_balance: null,
+    advance_adjustments: null,
+    last_payment_date: null,
   };
 }
 

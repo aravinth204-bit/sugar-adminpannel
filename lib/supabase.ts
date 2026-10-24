@@ -1,10 +1,16 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/lib/database.types";
 
+export type PaymentMethod = "cash" | "upi" | "bank" | "other";
+
 export type Customer = Database["public"]["Tables"]["customers"]["Row"] & {
   total_billed: number | null;
   total_paid: number | null;
   pending_balance: number | null;
+  advance_balance: number | null;
+  opening_balance: number | null;
+  advance_adjustments: number | null;
+  last_payment_date: string | null;
 };
 
 export type DailyTotals = {
@@ -19,6 +25,7 @@ export type RecentSale = {
   total_amount: number;
   amount_paid: number;
   overpaid_amount: number;
+  credit_applied: number;
   balance: number;
   sale_unit: "500g" | "1kg" | "bulk";
   sale_quantity: number;
@@ -40,6 +47,9 @@ export type RecentPayment = {
   payment_date: string;
   amount: number;
   notes: string | null;
+  payment_method: PaymentMethod;
+  reference: string | null;
+  paid_at: string;
   created_at: string;
 };
 
@@ -49,6 +59,11 @@ export type CustomerSummaryResult = {
   totalBilled: number | null;
   totalPaid: number | null;
   outstanding: number | null;
+  totalAdvance: number | null;
+  openingBalanceTotal: number | null;
+  dueCustomerCount: number | null;
+  collectedToday: number | null;
+  collectedThisMonth: number | null;
   dailyTotals: Record<string, DailyTotals>;
   recentSales: RecentSale[];
   recentPayments: RecentPayment[];
@@ -71,9 +86,14 @@ export type LedgerEntry =
       sale_unit: "500g" | "1kg" | "bulk";
       sale_quantity: number;
       rate_per_unit: number;
+      overpaid_amount: number;
+      credit_applied: number;
       debit: number;
       credit: number;
       balance: number;
+      payment_method: "cash" | "upi";
+      reference: null;
+      paid_at: string;
       created_at: string;
     }
   | {
@@ -86,9 +106,34 @@ export type LedgerEntry =
       sale_unit: null;
       sale_quantity: null;
       rate_per_unit: null;
+      overpaid_amount: null;
+      credit_applied: null;
       debit: number;
       credit: number;
       balance: number;
+      payment_method: PaymentMethod;
+      reference: string | null;
+      paid_at: string;
+      created_at: string;
+    }
+  | {
+      id: string;
+      kind: "opening";
+      date: string;
+      description: string;
+      quantity_kg: null;
+      unit_price: null;
+      sale_unit: null;
+      sale_quantity: null;
+      rate_per_unit: null;
+      overpaid_amount: null;
+      credit_applied: null;
+      debit: number;
+      credit: number;
+      balance: number;
+      payment_method: null;
+      reference: null;
+      paid_at: string;
       created_at: string;
     };
 
@@ -141,6 +186,7 @@ type SalesSummaryRow = Pick<
   | "total_amount"
   | "amount_paid"
   | "overpaid_amount"
+  | "credit_applied"
   | "balance"
   | "sale_unit"
   | "sale_quantity"
@@ -155,7 +201,34 @@ type SalesSummaryRow = Pick<
 >;
 type PaymentSummaryRow = Pick<
   Database["public"]["Tables"]["payments"]["Row"],
+  | "customer_id"
+  | "payment_date"
+  | "amount"
+  | "id"
+  | "notes"
+  | "payment_method"
+  | "reference"
+  | "paid_at"
+  | "created_at"
+>;
+
+type OpeningBalanceRow = Pick<
+  Database["public"]["Tables"]["customer_opening_balances"]["Row"],
+  "customer_id" | "amount" | "effective_date" | "notes" | "created_at"
+>;
+
+type LegacyPaymentSummaryRow = Pick<
+  Database["public"]["Tables"]["payments"]["Row"],
   "customer_id" | "payment_date" | "amount" | "id" | "notes" | "created_at"
+>;
+
+type LegacyLedgerPaymentRow = Pick<
+  Database["public"]["Tables"]["payments"]["Row"],
+  | "id"
+  | "payment_date"
+  | "amount"
+  | "notes"
+  | "created_at"
 >;
 
 const QUERY_PAGE_SIZE = 500;
@@ -280,12 +353,12 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       .range(from, to),
   );
 
-  const [salesResult, paymentsResult] = await Promise.all([
+  const [salesResult, paymentsResult, openingResult] = await Promise.all([
     fetchAllPages<SalesSummaryRow>(async (from, to) =>
       await supabase
         .from("sales")
         .select(
-          "id, customer_id, sale_date, total_amount, amount_paid, overpaid_amount, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
+          "id, customer_id, sale_date, total_amount, amount_paid, overpaid_amount, credit_applied, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
           { count: from === 0 ? "exact" : undefined },
         )
         .order("sale_date", { ascending: false })
@@ -295,24 +368,63 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     fetchAllPages<PaymentSummaryRow>(async (from, to) =>
       await supabase
         .from("payments")
-        .select("customer_id, payment_date, amount, id, notes, created_at", {
-          count: from === 0 ? "exact" : undefined,
-        })
+        .select(
+          "customer_id, payment_date, amount, id, notes, payment_method, reference, paid_at, created_at",
+          { count: from === 0 ? "exact" : undefined },
+        )
         .order("payment_date", { ascending: false })
         .order("id", { ascending: false })
         .range(from, to),
+    ).catch(async (error: unknown) => {
+      if (isMissingColumnError(error)) {
+        const legacy = await fetchAllPages<LegacyPaymentSummaryRow>(
+          async (from, to) =>
+            await supabase
+              .from("payments")
+              .select("customer_id, payment_date, amount, id, notes, created_at", {
+                count: from === 0 ? "exact" : undefined,
+              })
+              .order("payment_date", { ascending: false })
+              .order("id", { ascending: false })
+              .range(from, to),
+        );
+        return {
+          rows: legacy.rows.map(
+            (payment): PaymentSummaryRow => ({
+              ...payment,
+              payment_method: "cash",
+              reference: null,
+              paid_at: payment.created_at,
+            }),
+          ),
+          complete: legacy.complete,
+        };
+      }
+      return handleMissingTable<PaymentSummaryRow>(error);
+    }),
+    fetchAllPages<OpeningBalanceRow>(async (from, to) =>
+      await supabase
+        .from("customer_opening_balances")
+        .select("customer_id, amount, effective_date, notes, created_at", {
+          count: from === 0 ? "exact" : undefined,
+        })
+        .order("customer_id")
+        .range(from, to),
     ).catch((error: unknown) =>
-      handleMissingTable<PaymentSummaryRow>(error),
+      handleMissingTable<OpeningBalanceRow>(error),
     ),
   ]);
 
   const salesAvailable = salesResult !== null;
   const paymentsAvailable = paymentsResult !== null;
+  const openingAvailable = openingResult !== null;
   const salesComplete = salesResult?.complete ?? false;
   const paymentsComplete = paymentsResult?.complete ?? false;
+  const openingComplete = openingResult?.complete ?? false;
   const customersComplete = customersResult.complete;
   const sales = salesResult?.rows ?? [];
   const payments = paymentsResult?.rows ?? [];
+  const openings = openingResult?.rows ?? [];
   const canUseSales = salesAvailable && salesComplete;
   const canUsePayments = paymentsAvailable && paymentsComplete;
   const canCalculateCollected = canUseSales && canUsePayments;
@@ -320,10 +432,30 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     string,
     { billedCents: number; paidCents: number }
   >();
+  const openingByCustomer = new Map<string, number>();
+  const advanceAdjustedByCustomer = new Map<string, number>();
+  const lastPaymentByCustomer = new Map<string, string>();
   const dailyTotalsCents = new Map<
     string,
     { salesCents: number; collectionCents: number }
   >();
+  const businessDate = getBusinessDate();
+  const businessMonth = businessDate.slice(0, 7);
+  let todayCollectionCents = 0;
+  let monthCollectionCents = 0;
+
+  for (const opening of openings) {
+    openingByCustomer.set(
+      opening.customer_id,
+      toCents(Number(opening.amount)),
+    );
+    if (!totalsByCustomer.has(opening.customer_id)) {
+      totalsByCustomer.set(opening.customer_id, {
+        billedCents: 0,
+        paidCents: 0,
+      });
+    }
+  }
 
   if (canUseSales) {
     for (const sale of sales) {
@@ -339,6 +471,25 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       totals.billedCents += billedCents;
       totals.paidCents += salePaidCents;
       totalsByCustomer.set(sale.customer_id, totals);
+      advanceAdjustedByCustomer.set(
+        sale.customer_id,
+        (advanceAdjustedByCustomer.get(sale.customer_id) ?? 0) +
+          toCents(Number(sale.credit_applied)),
+      );
+      if (salePaidCents > 0) {
+        const previousSalePaymentDate = lastPaymentByCustomer.get(
+          sale.customer_id,
+        );
+        if (!previousSalePaymentDate || sale.sale_date > previousSalePaymentDate) {
+          lastPaymentByCustomer.set(sale.customer_id, sale.sale_date);
+        }
+      }
+      if (sale.sale_date === businessDate) {
+        todayCollectionCents += salePaidCents;
+      }
+      if (sale.sale_date.startsWith(businessMonth)) {
+        monthCollectionCents += salePaidCents;
+      }
 
       const daily = dailyTotalsCents.get(sale.sale_date) ?? {
         salesCents: 0,
@@ -358,6 +509,16 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       };
       totals.paidCents += paidCents;
       totalsByCustomer.set(payment.customer_id, totals);
+      const previousPaymentDate = lastPaymentByCustomer.get(payment.customer_id);
+      if (!previousPaymentDate || payment.payment_date > previousPaymentDate) {
+        lastPaymentByCustomer.set(payment.customer_id, payment.payment_date);
+      }
+      if (payment.payment_date === businessDate) {
+        todayCollectionCents += paidCents;
+      }
+      if (payment.payment_date.startsWith(businessMonth)) {
+        monthCollectionCents += paidCents;
+      }
 
       const daily = dailyTotalsCents.get(payment.payment_date) ?? {
         salesCents: 0,
@@ -384,10 +545,33 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       ) +
       payments.reduce((sum, payment) => sum + toCents(Number(payment.amount)), 0)
     : null;
+  const openingTotalCents = openings.reduce(
+    (sum, opening) => sum + toCents(Number(opening.amount)),
+    0,
+  );
   const outstandingCents = canCalculateCollected
-    ? Array.from(totalsByCustomer.values()).reduce(
-        (sum, totals) =>
-          sum + Math.max(0, totals.billedCents - totals.paidCents),
+    ? Array.from(totalsByCustomer.entries()).reduce(
+        (sum, [customerId, totals]) =>
+          sum +
+          Math.max(
+            0,
+            totals.billedCents +
+              (openingByCustomer.get(customerId) ?? 0) -
+              totals.paidCents,
+          ),
+        0,
+      )
+    : null;
+  const advanceCents = canCalculateCollected
+    ? Array.from(totalsByCustomer.entries()).reduce(
+        (sum, [customerId, totals]) =>
+          sum +
+          Math.max(
+            0,
+            totals.paidCents -
+              totals.billedCents -
+              (openingByCustomer.get(customerId) ?? 0),
+          ),
         0,
       )
     : null;
@@ -405,17 +589,30 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       `Payments exceed the ${MAX_DASHBOARD_ROWS.toLocaleString("en-IN")} row dashboard safety limit; collection and due totals are withheld.`,
     );
   }
+  if (!openingAvailable) {
+    warnings.push(
+      "Opening balances are unavailable. Apply the latest Supabase migration so previous dues are included in customer balances.",
+    );
+  } else if (!openingComplete) {
+    warnings.push(
+      `Opening balances exceed the ${MAX_DASHBOARD_ROWS.toLocaleString("en-IN")} row dashboard safety limit; previous dues may be incomplete.`,
+    );
+  }
   if (!customersComplete) {
     warnings.push(
       `Customer records exceed the ${MAX_DASHBOARD_ROWS.toLocaleString("en-IN")} row dashboard safety limit; the list and customer count may be incomplete.`,
     );
   }
 
+  const canUseOpening = openingAvailable && openingComplete;
   const customers = customersResult.rows.map((customer) => {
     const totals = totalsByCustomer.get(customer.id) ?? {
       billedCents: 0,
       paidCents: 0,
     };
+    const openingCents = canUseOpening
+      ? (openingByCustomer.get(customer.id) ?? 0)
+      : 0;
     const totalBilled = canUseSales ? fromCents(totals.billedCents) : null;
     const totalPaid = canCalculateCollected
       ? fromCents(totals.paidCents)
@@ -426,10 +623,31 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
       total_paid: totalPaid,
       pending_balance:
         totalBilled !== null && totalPaid !== null
-          ? fromCents(Math.max(0, totals.billedCents - totals.paidCents))
+          ? fromCents(
+              Math.max(0, totals.billedCents + openingCents - totals.paidCents),
+            )
           : null,
+      advance_balance:
+        totalBilled !== null && totalPaid !== null
+          ? fromCents(
+              Math.max(0, totals.paidCents - totals.billedCents - openingCents),
+            )
+          : null,
+      opening_balance: canUseOpening ? fromCents(openingCents) : null,
+      advance_adjustments: canUseSales
+        ? fromCents(advanceAdjustedByCustomer.get(customer.id) ?? 0)
+        : null,
+      last_payment_date: canCalculateCollected
+        ? (lastPaymentByCustomer.get(customer.id) ?? null)
+        : null,
     };
   });
+  const dueCustomerCount = canCalculateCollected
+    ? customers.filter(
+        (customer) =>
+          customer.pending_balance !== null && customer.pending_balance > 0,
+      ).length
+    : null;
 
   const dailyTotals: Record<string, DailyTotals> = {};
   if (canUseSales) {
@@ -469,6 +687,15 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     totalPaid: allTimePaidCents === null ? null : fromCents(allTimePaidCents),
     outstanding:
       outstandingCents === null ? null : fromCents(outstandingCents),
+    totalAdvance: advanceCents === null ? null : fromCents(advanceCents),
+    openingBalanceTotal: canUseOpening ? fromCents(openingTotalCents) : null,
+    dueCustomerCount,
+    collectedToday: canCalculateCollected
+      ? fromCents(todayCollectionCents)
+      : null,
+    collectedThisMonth: canCalculateCollected
+      ? fromCents(monthCollectionCents)
+      : null,
     dailyTotals,
     recentSales: canUseSales ? sales.slice(0, 25) : [],
     recentPayments: canCalculateCollected ? payments.slice(0, 25) : [],
@@ -479,6 +706,13 @@ export async function fetchCustomersWithTotals(): Promise<CustomerSummaryResult>
     customersComplete,
     warning: warnings.length ? warnings.join(" ") : null,
   };
+}
+
+function isMissingColumnError(error: unknown): boolean {
+  return (
+    error instanceof SupabaseQueryError &&
+    (error.code === "42703" || error.code === "PGRST204")
+  );
 }
 
 async function handleMissingTable<T>(
@@ -676,7 +910,7 @@ export async function fetchSalesHistory(): Promise<SaleRecord[]> {
     await supabase
       .from("sales")
       .select(
-        "id, customer_id, sale_date, total_amount, amount_paid, overpaid_amount, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
+        "id, customer_id, sale_date, total_amount, amount_paid, overpaid_amount, credit_applied, balance, sale_unit, sale_quantity, rate_per_unit, notes, discount_amount, payment_method, status, cancelled_at, cancel_reason, created_at",
         { count: from === 0 ? "exact" : undefined },
       )
       .order("sale_date", { ascending: false })
@@ -706,20 +940,56 @@ export async function recordStandalonePayment(input: {
   customerId: string;
   amount: number;
   paymentDate?: string;
+  paidAt?: string;
+  paymentMethod?: PaymentMethod;
+  reference?: string;
   notes?: string;
 }): Promise<string> {
   if (!input.customerId) throw new Error("Select a customer.");
   if (!Number.isFinite(input.amount) || input.amount <= 0) {
     throw new Error("Payment must be greater than zero.");
   }
+  if (
+    input.paymentMethod &&
+    !["cash", "upi", "bank", "other"].includes(input.paymentMethod)
+  ) {
+    throw new Error("Select a valid payment method.");
+  }
 
   const { data, error } = await getSupabaseClient().rpc(
-    "record_old_due_payment",
+    "record_customer_payment",
     {
       p_customer_id: input.customerId,
-      p_amount: input.amount,
+      p_amount: Math.round(input.amount * 100) / 100,
       p_payment_date:
         input.paymentDate || new Date().toISOString().slice(0, 10),
+      p_notes: input.notes?.trim() || null,
+      p_payment_method: input.paymentMethod ?? "cash",
+      p_reference: input.reference?.trim() || null,
+      p_paid_at: input.paidAt || new Date().toISOString(),
+    },
+  );
+  return requireData(data, error);
+}
+
+export async function setOpeningBalance(input: {
+  customerId: string;
+  amount: number;
+  effectiveDate?: string;
+  notes?: string;
+}): Promise<string> {
+  if (!input.customerId) throw new Error("Select a customer.");
+  if (!Number.isFinite(input.amount) || input.amount < 0) {
+    throw new Error("Opening balance cannot be negative.");
+  }
+
+  const { data, error } = await getSupabaseClient().rpc(
+    "set_customer_opening_balance",
+    {
+      p_customer_id: input.customerId,
+      p_amount: Math.round(input.amount * 100) / 100,
+      p_effective_date:
+        input.effectiveDate || new Date().toISOString().slice(0, 10),
       p_notes: input.notes?.trim() || null,
     },
   );
@@ -730,22 +1000,84 @@ export async function fetchCustomerLedger(
   customerId: string,
 ): Promise<LedgerEntry[]> {
   const supabase = getSupabaseClient();
-  const [salesResult, paymentsResult] = await Promise.all([
+  const [salesResult, paymentsResult, openingResult] = await Promise.all([
     supabase
       .from("sales")
       .select(
-        "id, sale_date, quantity_kg, unit_price, sale_unit, sale_quantity, rate_per_unit, total_amount, amount_paid, overpaid_amount, balance, notes, status, created_at",
+        "id, sale_date, quantity_kg, unit_price, sale_unit, sale_quantity, rate_per_unit, total_amount, amount_paid, overpaid_amount, credit_applied, balance, notes, payment_method, status, created_at",
       )
       .eq("customer_id", customerId),
     supabase
       .from("payments")
-      .select("id, payment_date, amount, notes, created_at")
+      .select(
+        "id, payment_date, amount, notes, payment_method, reference, paid_at, created_at",
+      )
       .eq("customer_id", customerId),
+    supabase
+      .from("customer_opening_balances")
+      .select("id, amount, effective_date, notes, created_at")
+      .eq("customer_id", customerId)
+      .maybeSingle(),
   ]);
   const sales = requireData(salesResult.data, salesResult.error);
-  const payments = requireData(paymentsResult.data, paymentsResult.error);
+  let payments: (LegacyLedgerPaymentRow & {
+    payment_method: PaymentMethod;
+    reference: string | null;
+    paid_at: string;
+  })[];
+  if (paymentsResult.error) {
+    if (
+      paymentsResult.error.code === "42703" ||
+      paymentsResult.error.code === "PGRST204"
+    ) {
+      const legacyPayments = await supabase
+        .from("payments")
+        .select("id, payment_date, amount, notes, created_at")
+        .eq("customer_id", customerId);
+      payments = requireData(
+        legacyPayments.data,
+        legacyPayments.error,
+      ).map((payment) => ({
+        ...payment,
+        payment_method: "cash" as PaymentMethod,
+        reference: null,
+        paid_at: payment.created_at,
+      }));
+    } else {
+      throw new Error(paymentsResult.error.message);
+    }
+  } else {
+    payments = paymentsResult.data;
+  }
+  const opening = openingResult.error ? null : openingResult.data;
 
   const entries: LedgerEntry[] = [
+    ...(opening && Number(opening.amount) > 0
+      ? [
+          {
+            id: opening.id,
+            kind: "opening" as const,
+            date: opening.effective_date,
+            description:
+              opening.notes ||
+              "Opening balance carried forward from the previous ledger",
+            quantity_kg: null,
+            unit_price: null,
+            sale_unit: null,
+            sale_quantity: null,
+            rate_per_unit: null,
+            overpaid_amount: null,
+            credit_applied: null,
+            debit: Number(opening.amount),
+            credit: 0,
+            balance: 0,
+            payment_method: null,
+            reference: null,
+            paid_at: opening.created_at,
+            created_at: opening.created_at,
+          },
+        ]
+      : []),
     ...sales
       .filter((sale) => sale.status === "completed")
       .map((sale): LedgerEntry => ({
@@ -758,24 +1090,34 @@ export async function fetchCustomerLedger(
         sale_unit: sale.sale_unit,
         sale_quantity: Number(sale.sale_quantity),
         rate_per_unit: Number(sale.rate_per_unit),
+        overpaid_amount: Number(sale.overpaid_amount),
+        credit_applied: Number(sale.credit_applied),
         debit: Number(sale.total_amount),
         credit: Number(sale.amount_paid) + Number(sale.overpaid_amount),
         balance: Number(sale.balance),
+        payment_method: sale.payment_method,
+        reference: null,
+        paid_at: sale.created_at,
         created_at: sale.created_at,
       })),
     ...payments.map((payment): LedgerEntry => ({
       id: payment.id,
       kind: "payment",
       date: payment.payment_date,
-      description: payment.notes || "Payment against old dues",
+      description: payment.notes || "Customer payment received",
       quantity_kg: null,
       unit_price: null,
       sale_unit: null,
       sale_quantity: null,
       rate_per_unit: null,
+      overpaid_amount: null,
+      credit_applied: null,
       debit: 0,
       credit: Number(payment.amount),
       balance: 0,
+      payment_method: payment.payment_method,
+      reference: payment.reference,
+      paid_at: payment.paid_at,
       created_at: payment.created_at,
     })),
   ];
@@ -783,6 +1125,7 @@ export async function fetchCustomerLedger(
   const chronological = entries.sort(
     (left, right) =>
       left.date.localeCompare(right.date) ||
+      left.paid_at.localeCompare(right.paid_at) ||
       left.created_at.localeCompare(right.created_at),
   );
   let runningBalance = 0;

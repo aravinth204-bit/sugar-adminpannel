@@ -109,6 +109,9 @@ export type Database = {
           payment_date: string;
           amount: number;
           notes: string | null;
+          payment_method: "cash" | "upi" | "bank" | "other";
+          reference: string | null;
+          paid_at: string;
           created_at: string;
         };
         Insert: {
@@ -117,6 +120,9 @@ export type Database = {
           payment_date?: string;
           amount: number;
           notes?: string | null;
+          payment_method?: "cash" | "upi" | "bank" | "other";
+          reference?: string | null;
+          paid_at?: string;
           created_at?: string;
         };
         Update: {
@@ -125,7 +131,40 @@ export type Database = {
           payment_date?: string;
           amount?: number;
           notes?: string | null;
+          payment_method?: "cash" | "upi" | "bank" | "other";
+          reference?: string | null;
+          paid_at?: string;
           created_at?: string;
+        };
+        Relationships: [];
+      };
+      customer_opening_balances: {
+        Row: {
+          id: string;
+          customer_id: string;
+          amount: number;
+          effective_date: string;
+          notes: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          customer_id: string;
+          amount: number;
+          effective_date?: string;
+          notes?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          customer_id?: string;
+          amount?: number;
+          effective_date?: string;
+          notes?: string | null;
+          created_at?: string;
+          updated_at?: string;
         };
         Relationships: [];
       };
@@ -168,6 +207,8 @@ export type Database = {
           address: string | null;
           created_at: string;
           pending_balance: number;
+          advance_balance: number;
+          opening_balance: number;
         }[];
       };
       add_sale: {
@@ -227,6 +268,27 @@ export type Database = {
           p_customer_id: string;
           p_amount: number;
           p_payment_date?: string;
+          p_notes?: string | null;
+        };
+        Returns: string;
+      };
+      record_customer_payment: {
+        Args: {
+          p_customer_id: string;
+          p_amount: number;
+          p_payment_date?: string;
+          p_notes?: string | null;
+          p_payment_method?: "cash" | "upi" | "bank" | "other";
+          p_reference?: string | null;
+          p_paid_at?: string;
+        };
+        Returns: string;
+      };
+      set_customer_opening_balance: {
+        Args: {
+          p_customer_id: string;
+          p_amount: number;
+          p_effective_date?: string;
           p_notes?: string | null;
         };
         Returns: string;

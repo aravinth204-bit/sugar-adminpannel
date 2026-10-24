@@ -15,9 +15,13 @@ All ledger tables use row-level security and require an authenticated Supabase u
 ## Ledger rules
 
 - Sale totals are calculated and rounded to two decimal places in the database from kilograms × price per kilogram.
-- Sale-time payments may exceed the amount due. The excess is saved as customer advance and automatically applied to that customer's next sale.
-- A standalone payment reduces the customer's aggregate outstanding balance and cannot exceed the current due.
-- Customer pending balances are computed as total sale amounts minus sale-time payments and standalone payments.
+- Sale-time payments and standalone payments may exceed the amount due. The excess is saved as customer advance and automatically applied to that customer's next sale.
+- Customer pending balances are computed as sale dues plus opening balance minus sale-time cash and standalone payments. Any cash beyond the billed total and opening balance is shown as advance credit.
+- Opening balances represent previous dues from before this system. They are stored once per customer in `customer_opening_balances`, shown as an Opening Balance ledger entry, and are never counted as sales or new cash collections.
+- Advance credit is applied automatically against the next sale, so only the remaining amount is collected. Advance adjustments are internal and are never counted as new cash.
+- Customer profiles, the customer directory, sales history, and receipts show how much advance was used or added.
 - Daily summary cards use the selected local calendar date for sale totals and cash collected. The quick-sale form supports 500 g packets, 1 kg packets, and bulk sales priced per kilogram.
-- WhatsApp reminders open a prefilled message; the admin reviews and sends it from WhatsApp.
+- The Payments & Due Ledger page supports partial/full/advance payments, payment methods and references, opening balances, customer-wise dues, ledger filters, CSV export, print-friendly ledgers, and editable WhatsApp reminders (Tamil or English).
+- Payment and opening-balance changes are recorded in audit tables by database triggers.
+- WhatsApp reminders open a prefilled, editable message in WhatsApp; the admin reviews and sends it manually.
 - The schema expects a single currency; add currency support before recording transactions in multiple currencies.
